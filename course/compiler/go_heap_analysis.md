@@ -6,32 +6,68 @@
 
 内存管理的常见方式
 
-### overview
+# overview
 
+# 原始堆内存
 
+操作系统提供的虚拟内存空间，是由寻找空间决定的，在amd64位系统上，有48个bit用于寻址，所以我们的可用地址空间，在1<<48个，这里没有占满64bit，因为48bit已经提供了256TB的虚拟地址寻址空间。这几乎已经足够大部分的系统应用了。
 
-### mheap
+go中共使用了128TB的内存，用于初始化内存分配池
 
-概念：
-arena：一段虚拟内存空间，go中定义为64MB，用heapArena类型表达。
-arenahint：一大段虚拟内存空间，用于分配一个或多个arena空间。
+```go
+func mallocinit() {
+	...
 
+	// Initialize the heap.
+	mheap_.init()
+	_g_ := getg()
+	_g_.m.mcache = allocmcache()
 
+	if sys.PtrSize == 8 && GOARCH != "wasm" {
+    // 64位系统下，获得128个1TB内存块的起始地址
+		for i := 0x7f; i >= 0; i-- {
+			var p uintptr
+			switch {
+			case GOARCH == "arm64" && GOOS == "darwin":
+				p = uintptr(i)<<40 | uintptrMask&(0x0013<<28)
+			case GOARCH == "arm64":
+				p = uintptr(i)<<40 | uintptrMask&(0x0040<<32)
+			default:
+				p = uintptr(i)<<40 | uintptrMask&(0x00c0<<32)
+			}
+      // 起始地址被保存在arenaHint链表中
+			hint := (*arenaHint)(mheap_.arenaHintAlloc.alloc())
+			hint.addr = p
+			hint.next, mheap_.arenaHints = mheap_.arenaHints, hint
+		}
+	} else {
+```
 
 ### arenaHints
 
 ```go
 type arenaHint struct {
 	addr uintptr		// 记录了在当前arenaHint的区间内，已经分配到的内存地址位置，addr只会单调增长或降低。
-	down bool			// 默认为false，从低地址向高地址增长。当申请栈空间时为true。
+	down bool			// 默认为false，从低地址向高地址增长。
 	next *arenaHint		// 下一个arena区间的arenaHint对象
 }
 ```
 
 
-
-golang堆内存地址空间是0xC000000000 - (0x80C000000000-1)，总共128TB的空间，mallocinit中共创建了128个arenaHint指向这些地址。
 arenahint指向最原始的虚拟内存空间，runtime.sysAlloc函数分配空间时以heapArenaBytes(64MB)为单位从arenaHint链表头对象开始分配空间。当第一个arenaHint的1TB空间被用完后，将开始使用下一个arenaHint的空间。
+
+# mheap
+
+# 局部分配器
+
+## arena
+
+arena：一段虚拟内存空间，go中定义为64MB，用heapArena类型表达。
+arenahint：一大段虚拟内存空间，用于分配一个或多个arena空间。
+
+
+
+
 
 
 
@@ -171,7 +207,7 @@ mTreap提供一个insert方法用于插入mspan。并提供了两个方法用于
 
 ##### 小常识
 
-可以注意到，很多对象都包含一个init函数，用于初始化成员变量。但是我们在编码过程中却不需要显式初始化，那是因为go替我们完成了初始化，但是在go语言内部，没有在堆上分配的对象，是不会被初始化的（内存置0），所以很多runtime的结构，都需要这样的显式初始化。
+可以注意到，runtime包中很多对象都包含一个init函数，用于初始化成员变量。但是我们在编码过程中却不需要显式初始化，那是因为go替我们完成了初始化，但是在go语言内部，没有在堆上分配的对象，是不会被初始化的（内存置0），所以很多runtime的结构，都需要这样的显式初始化。
 
 #### mSpanList
 
@@ -301,6 +337,12 @@ func Ctz64(x uint64) int {
 
 https://en.wikipedia.org/wiki/De_Bruijn_sequence
 http://supertech.csail.mit.edu/papers/debruijn.pdf
+
+
+
+## 引用
+
+[https://github.com/qyuhen/book/blob/master/Go%201.5%20%E6%BA%90%E7%A0%81%E5%89%96%E6%9E%90.pdf](https://github.com/qyuhen/book/blob/master/Go 1.5 源码剖析.pdf)
 
 
 

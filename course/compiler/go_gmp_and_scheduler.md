@@ -18,3 +18,8 @@ allgs - 所有的g对象指针slice
 
 allglock - 用于锁allgs
 
+
+
+需要的图
+
+g、m、p状态转移图
