@@ -171,13 +171,14 @@ type p struct {
   // p对象id
 	id          int32
   // p状态
-	status      uint32 // one of pidle/prunning/...
+	status      uint32
   // p对象链表指针，用于在schedt中以链表形式保存未使用的p对象
 	link        puintptr
 	schedtick   uint32     // incremented on every scheduler call
 	syscalltick uint32     // incremented on every system call
 	sysmontick  sysmontick // last tick observed by sysmon
-	m           muintptr   // back-link to associated m (nil if idle)
+  // p对象当前关联的m对象，如果处于_Pidle状态，则p.m为nil。
+	m           muintptr
   // 线程无锁内存分配器，m运行时从p获取，用于线程内内存申请
 	mcache      *mcache
 	racectx     uintptr
@@ -185,12 +186,11 @@ type p struct {
 	deferpool    [5][]*_defer // pool of available defer structs of different sizes (see panic.go)
 	deferpoolbuf [5][32]*_defer
 
-	// Cache of goroutine ids, amortizes accesses to runtime·sched.goidgen.
+	// goroutine ID缓存，每次从schedt获取16个，goidcacheend为16个的最大值。如果创建g对象时发现goidcache == goidcacheend，则再向schedt申请16个。
 	goidcache    uint64
 	goidcacheend uint64
 
-	// Queue of runnable goroutines. Accessed without lock.
-  // 无锁_Grunnable状态待运行g对象环形队列。
+  // 无锁_Grunnable状态待运行g对象（_Grunnable）环形队列。
 	runqhead uint32
 	runqtail uint32
 	runq     [256]guintptr
@@ -205,12 +205,12 @@ type p struct {
 	// goroutines to the end of the run queue.
 	runnext guintptr
 
-	// Available G's (status == Gdead)
-  // 空闲g链表头，通过g.schedlink链接起来
-	gfree    *g			
+  // 空闲g（状态为_Gdead）链表头，通过g.schedlink链接起来
+	gfree    *g
 	gfreecnt int32
 
-	sudogcache []*sudog	// 空闲sudog对象缓存slice
+  // 空闲sudog对象缓存slice
+	sudogcache []*sudog	
 	sudogbuf   [128]*sudog
 
 	tracebuf traceBufPtr
@@ -256,6 +256,7 @@ type p struct {
 ```go
 type schedt struct {
 	// accessed atomically. keep at top to ensure alignment on 32-bit systems.
+  // goroutine ID生成器，从0开始递增，p对象每次从这里获取16个id。
 	goidgen  uint64
 	lastpoll uint64
 
@@ -264,45 +265,48 @@ type schedt struct {
 	// When increasing nmidle, nmidlelocked, nmsys, or nmfreed, be
 	// sure to call checkdead().
 
-	midle        muintptr // idle m's waiting for work
-	nmidle       int32    // number of idle m's waiting for work
+  // 空闲的m对象，通过mget/mput方法操作该列表
+	midle        muintptr
+  // 空闲m对象的数量
+	nmidle       int32
 	nmidlelocked int32    // number of locked m's waiting for work
   // 递增的计数，用于生成mid，在mcommoninit中赋值给m.id后加1
-	mnext        int64    // number of m's that have been created and next M ID
-  // 最大m数量，mnext超过此值抛出异常
-	maxmcount    int32    // maximum number of m's allowed (or die)
+	mnext        int64
+  // 最大m数量，mnext超过此值抛出异常，在schedinit中被设置为1万
+	maxmcount    int32
 	nmsys        int32    // number of system m's not counted for deadlock
 	nmfreed      int64    // cumulative number of freed m's
 
 	ngsys uint32 // number of system goroutines; updated atomically
 
-	pidle      puintptr // idle p's
+  // 空闲的p对象(_Pidle)，通过p.link链接，通过pidleput/pidleget操作该列表
+	pidle      puintptr
+  // 空闲p对象的数量
 	npidle     uint32
 	nmspinning uint32 // See "Worker thread parking/unparking" comment in proc.go.
 
-	// Global runnable queue.
-  // 全局_Grunnable状态的g对象链表，通过schedlink指针链接
+  // 全局_Grunnable状态的g对象链表，通过g.schedlink指针链接
 	runqhead guintptr
 	runqtail guintptr
 	runqsize int32
 
-	// Global cache of dead G's.
+	// 用于操作gfreeStack、gfreeNoStack的锁
 	gflock       mutex
   // 用于保存处于_Gdead状态的全局空g对象，分有栈或没栈的g对象，用于快速分配新g
 	gfreeStack   *g
 	gfreeNoStack *g
 	ngfree       int32
 
-	// Central cache of sudog structs.
-	sudoglock  mutex	// 用于锁住sudogcache链表
-	sudogcache *sudog	// 空闲sudog对象缓存链表，通过sudog.next指针链接
+  // 用于锁住sudogcache链表
+	sudoglock  mutex	
+  // 空闲sudog对象缓存链表，通过sudog.next指针链接
+	sudogcache *sudog	
 
 	// Central pool of available defer structs of different sizes.
 	deferlock mutex
 	deferpool [5]*_defer
 
-	// freem is the list of m's waiting to be freed when their
-	// m.exited is set. Linked through m.freelink.
+	// 待释放的m对象，在allocm中被释放
 	freem *m
 
 	gcwaiting  uint32 // gc is waiting to run
@@ -320,8 +324,9 @@ type schedt struct {
 	profilehz int32 // cpu profiling rate
 
   // 最近一次调用procresize的纳秒时间戳，用于统计totaltime
-	procresizetime int64 // nanotime() of last change to gomaxprocs
+	procresizetime int64
   // 所有p对象累积工作时长，在每次procresize时累加
-	totaltime      int64 // ∫gomaxprocs dt up to procresizetime
+	totaltime      int64
 }
 ```
+
