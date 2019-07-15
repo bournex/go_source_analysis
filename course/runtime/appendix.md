@@ -98,7 +98,8 @@ type m struct {
 	goSigStack    gsignalStack // Go-allocated signal handling stack
 	sigmask       sigset       // storage for saved signal mask
 	tls           [6]uintptr   // thread-local storage (for x86 extern register)
-  // 线程回调函数，当m启动时在mstart1中被调用的方法。
+  // 线程回调函数，在allocm中被设置。进入c代码启动线程后，在mstart1中被调用。
+  // 未设定该函数对象的m对象，将通过schedule去执行_Grunnable的g对象。
 	mstartfn      func()
   // 当前m指针执行中的用户态g指针
 	curg          *g       // current running goroutine
@@ -329,4 +330,3 @@ type schedt struct {
 	totaltime      int64
 }
 ```
-
