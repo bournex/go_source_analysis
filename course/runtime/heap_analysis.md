@@ -14,9 +14,13 @@ go的内存管理参考了tcmalloc，tcmalloc是google开源的一款内存管�
 
 而对于大内存需求，则不提供线程局部分配器。所有请求都统一通过heap来管理。
 
+
+
 ## ptmalloc  vs  tcmalloc
 
 ptmalloc是glibc中默认的内存分配器。
+
+
 
 # 原始堆内存
 
@@ -53,6 +57,8 @@ func mallocinit() {
 	} else {
 ```
 
+
+
 ## arenaHints
 
 ```go
@@ -63,10 +69,11 @@ type arenaHint struct {
 }
 ```
 
-
 arenahint指向最原始的虚拟内存空间，runtime.sysAlloc函数分配空间时以heapArenaBytes(64MB)为单位从arenaHint链表头对象开始分配空间。当第一个arenaHint的1TB空间被用完后，将开始使用下一个arenaHint的空间。
 
-# mheap
+
+
+# 系统级内存管理
 
 ## overview
 
@@ -116,13 +123,17 @@ type mheap struct {
 }
 ```
 
-## arena
+
+
+## Arena
+
+### arena
 
 arena是tcmalloc中没有的概念，go中基于垃圾回收的考虑，需要对内存进行更加精细化的管理。所以增加了arena的概念。arena中文翻译是竞技场，没什么卵用。go中将堆内存划分为64MB的块。
 
 
 
-## heapArena
+### heapArena
 
 ```go
 type heapArena struct {
@@ -144,11 +155,9 @@ type heapArena struct {
 }
 ```
 
-
-
 heapArena标识一个64MB的arena。整个虚拟内存地址空间，被按照arena管理起来，每64MB对应一个heapArena对象。heapArena对象通过persistentalloc申请，申请的对象被挂到mheap.arenas二级索引下。
 
-spans我们稍后再看
+mspan相关内容稍后再看。
 
 
 
@@ -158,7 +167,24 @@ malloc.go中提供了几个主要的内存分配方法。这些方法实现了�
 
 
 
-### persistentalloc
+### 系统级内存分配方法
+
+```go
+// 从v开始映射长度为n的内存，底层依赖mmap
+func sysMap(v unsafe.Pointer, n uintptr, sysStat *uint64)
+// 从v开始保留长度为n的内存，底层依赖mmap
+func sysReserve(v unsafe.Pointer, n uintptr) unsafe.Pointer
+// 释放从v开始的长度为n的内存，底层依赖munmap
+func sysFree(v unsafe.Pointer, n uintptr, sysStat *uint64)
+// 申请长度为n的内存，返回系统指定的虚拟内存空间起始地址
+func sysAlloc(n uintptr, sysStat *uint64) unsafe.Pointer
+// 向系统归还从v开始的指定长度n的内存，底层依赖madvise
+func sysUnused(v unsafe.Pointer, n uintptr)
+```
+
+
+
+### 小内存非堆分配器 - persistentalloc
 
 全局小内存块申请方法。该方法传入一个需求大小和对齐大小、返回一个指针，指向申请的空间起始地址。其中align必须是2的指数倍且小于pageSize。
 
@@ -178,6 +204,8 @@ func persistentalloc1(size, align uintptr, sysStat *uint64) *notInHeap {
 		return (*notInHeap)(sysAlloc(size, sysStat))
 	}
 
+  // 获取当前m对象下的persistentAlloc对象，如果当前没有运行在gmp环境下，则使用
+  // 全局的persistentAlloc对象分配内存，需要加锁。
 	mp := acquirem()
 	var persistent *persistentAlloc
 	if mp != nil && mp.p != 0 {
@@ -198,7 +226,7 @@ func persistentalloc1(size, align uintptr, sysStat *uint64) *notInHeap {
 		}
 		persistent.off = 0
 	}
-  // 在预分配的chunk上规划需要的内存，并找到首地址返回
+  // 在预分配的chunk上规划需要的内存，并找到首地址返回，增加base的偏移
 	p := persistent.base.add(persistent.off)
 	persistent.off += size
 	releasem(mp)
@@ -211,7 +239,7 @@ func persistentalloc1(size, align uintptr, sysStat *uint64) *notInHeap {
 }
 ```
 
-这段代码申请了一个满足size需求的空间。
+这段代码申请了一个满足size需求的空间。align会被对齐到2的指数倍。
 
 如果size大于64kb，则直接调用系统mmap分配空间。
 
@@ -225,9 +253,11 @@ persistentAlloc对象有全局和m局部之分。全局persistentAlloc对象包�
 
 注意persistentalloc1方法返回的是一个notInHeap指针，表明了该方法申请的内存不是在go划分的堆内存以内申请的。实际上chunk分配在哪儿，由于调用的是sysAlloc方法，所以实际内存在什么位置由操作系统指定。
 
-此外，persistentalloc1分配的内存不提供释放方法。这是由于该方法申请的空间在上层大多提供对象池实现，所以总体上来说其已分配的内存是收敛的。
+persistentalloc1分配的内存不提供释放方法。这是由于该方法申请的空间在上层大多提供对象池实现，所以总体上来说其已分配的内存是收敛的。
 
-##### persistentAlloc
+
+
+#### persistentAlloc
 
 ```go
 type persistentAlloc struct {
@@ -238,7 +268,7 @@ type persistentAlloc struct {
 
 
 
-### mheap.sysAlloc
+### 堆内存分配器 - mheap.sysAlloc
 
 sysAlloc只有在堆增长（mheap.grow）的时候才会被调用。
 
@@ -313,17 +343,226 @@ mapped:
 
 sysAlloc通过hints，从原始规划的堆空间申请一段符合需求量n的内存，返回其空间起始地址和实际mmap的内存大小。所有基于堆内存的分配，最终都指向了sysAlloc方法，这也是操作hints表达的堆内存的唯一途径。
 
-### 系统级内存分配方法
+
+
+### 定长对象分配器 - fixalloc
 
 ```go
-// 从v开始映射长度为n的内存，底层依赖mmap
-func sysMap(v unsafe.Pointer, n uintptr, sysStat *uint64)
-// 从v开始保留长度为n的内存，底层依赖mmap
-func sysReserve(v unsafe.Pointer, n uintptr) unsafe.Pointer
-// 释放从v开始的长度为n的内存，底层依赖munmap
-func sysFree(v unsafe.Pointer, n uintptr, sysStat *uint64)
-// 申请长度为n的内存，返回系统指定的虚拟内存空间起始地址
-func sysAlloc(n uintptr, sysStat *uint64) unsafe.Pointer
+type fixalloc struct {
+  // 固定对象长度
+	size   uintptr
+  // 
+	first  func(arg, p unsafe.Pointer)
+	arg    unsafe.Pointer
+  // 空闲对象链表指针
+	list   *mlink
+  // 当前用于分配新对象的chunk块偏移地址
+	chunk  uintptr
+  // 当前chunk块中剩余未分配的字节数量
+	nchunk uint32
+  // 当前chunk块中使用中的字节数量，inuse + nchunk = _FixAllocChunk
+	inuse  uintptr
+	stat   *uint64
+  // 是否需要将新申请的对象空间置为0
+	zero   bool
+}
+type mlink struct {
+  // 空闲对象链表指针，空闲的对象的内存是随机值，它的地址空间会被临时视为一个mlink对象
+  // 用于构建空闲对象内存链表。当一块空闲对象被分配时，mlink空间被覆盖。
+	next *mlink
+}
+```
+
+定长对象分配器不属于基本的内存分配器，但在堆中经常会用到。其实现也很简单
+
+```go
+func (f *fixalloc) alloc() unsafe.Pointer {
+	if f.size == 0 {
+		print("runtime: use of FixAlloc_Alloc before FixAlloc_Init\n")
+		throw("runtime: internal error")
+	}
+
+	if f.list != nil {
+    // 优先从空闲对象链表中查找
+		v := unsafe.Pointer(f.list)
+		f.list = f.list.next
+		f.inuse += f.size
+		if f.zero {
+			memclrNoHeapPointers(v, f.size)
+		}
+		return v
+	}
+  // 向系统申请_FixAllocChunk = 16KB的chunk块，用于对象分配。所以fixalloc只能
+  // 分配小于16KB的对象内存。
+	if uintptr(f.nchunk) < f.size {
+		f.chunk = uintptr(persistentalloc(_FixAllocChunk, 0, f.stat))
+		f.nchunk = _FixAllocChunk
+	}
+
+	v := unsafe.Pointer(f.chunk)
+	if f.first != nil {
+		f.first(f.arg, v)
+	}
+	f.chunk = f.chunk + f.size
+	f.nchunk -= uint32(f.size)
+	f.inuse += f.size
+	return v
+}
+
+func (f *fixalloc) free(p unsafe.Pointer) {
+  // 释放并将归还的内存解释为mlink，加入到空闲链表中
+	f.inuse -= f.size
+	v := (*mlink)(p)
+	v.next = f.list
+	f.list = v
+}
+```
+
+堆中管理了六类对象的fixalloc，后面会分别介绍。定长分配器中调用了persistentalloc来申请非堆小内存。
+
+
+
+### summary
+
+malloc.go中通过以上方法实现了虚拟内存的分配管理。对于小块的内存分配，通过在m对象中缓存256kb的chunk来实现县城局部的快速分配。对于大内存，则直接在hint指向的内存上，以64MB对齐的方式分配整块的内存空间，而这部分空间的精细管理，则由更新粒度的对象完成。
+
+
+
+## mheap
+
+对于更细粒度的对象，首先需要明确对象大小的划分，在runtime中，对象按大小被分为三类。
+
+tiny（小于等于16字节的空间）
+
+small（小于等于32KB字节的空间）
+
+large（大于32KB字节的空间）
+
+每种类型都有不同的分配方式。
+
+
+
+### sizeClass
+
+在内存管理中，大块内存比较容易管理，小块内存则是产生内存碎片的祸根。如果任由小块内存在系统中随机分配，最终会出现无法申请连续大块内存的情况。
+
+go中为了避免内存碎片，加速小内存的分配效率。对小内存进行了更细粒度的划分。
+
+go将小于等于32KB的内存，划分了67个级别。每个级别对应的内存块大小保存在class_to_size数组中。以class_to_size[4]为例，其值为32，即如果我们为一个大小为18字节的对象分配空间时，实际runtime中，会对齐到class_to_size[4]的32字节来申请空间。
+
+这种对小内存的管理方式，为我们实现不同大小对象之间无干扰的分配提供了可能。代价则是会损失一部分的空间。在sizeclasses.go中给出了各个sizeClass可能浪费的最大空间。
+
+至于为什么是67，这可能是相对准备32768个不同大小的分配器 和 过分离散的class导致的性能降低之间的一个折中。
+
+```go
+const (
+	_MaxSmallSize   = 32768
+	smallSizeDiv    = 8
+	smallSizeMax    = 1024
+	largeSizeDiv    = 128
+	_NumSizeClasses = 67
+)
+
+// 67种sizeclass对应的分配空间大小
+var class_to_size = [_NumSizeClasses]uint16{...}
+// 67种sizeclass对应的应分配的系统页数量
+var class_to_allocnpages = [_NumSizeClasses]uint8{...}
+// 小于1024字节的任意空间大小对应的sizeclass
+var size_to_class8 = [smallSizeMax/smallSizeDiv + 1]uint8{...}
+// 大于1024、小于32768字节的任意空间大小对应的sizeclass
+var size_to_class128 = [(_MaxSmallSize-smallSizeMax)/largeSizeDiv + 1]uint8{...}
+```
+
+
+
+### spanClass
+
+spanClass是sizeClass的一种特殊表达，它将sizeClass的索引（即0-66）左移一位，低位用于表达noscan标记。如果最低位为1，表示不需要GC扫描该spanClass下的对象。
+
+go在编译期间，可以通过代码的AST分析可以得出内存分配的类型，以及类型中是否包含指针类型。这是对象是否需要被GC扫描的重要依据。当runtime进行内存分配时，可以通过将需要扫描的和不需要扫描的对象分开管理申请和释放。提升无指针类型申请和释放的效率。
+
+
+
+### mspan
+
+```go
+type mspan struct {
+  // 用于构成链表时的链表指针
+	next *mspan
+	prev *mspan
+
+  // mspan指向的内存空间起始地址，可以通过mspan.base()方法获得
+	startAddr uintptr
+  // 当前mspan下的内存空间包含多少个系统页
+	npages    uintptr
+
+  // 用于栈内存管理TODO
+	manualFreeList gclinkptr
+
+	// 当前mspan空闲可分配的对象索引。如果freeindex==nelems，则mspan已无可用空间
+	freeindex uintptr
+	// 当前mspan能分配的elemsize大小对象的最大数量
+	nelems uintptr
+
+	// 作为当前allocBits的一个滑动窗口，用于快速计算当前的可用空间。
+  // why？因为mspan中的空间，有申请就有释放。之前申请的空间释放后，就会产生类似
+  // 碎片的东东。所以仅通过一个index是无法表达这些空闲碎片的。
+  // allocCache的64个bit位，表达了64个slot。初始化为^0
+  // 应用中，go通过德布鲁因算法快速获得当前allocCache中bit为1的最低位，作为
+  // freeindex的补充，通过freeindex+lowbit(allocCache)获得当前空闲的slot。
+  // 
+  // 同时，由于allocCache只能表达64个slot，所以还需要配合allocBits来使用。
+	allocCache uint64
+
+	// 当前mspan中slot使用情况汇总。在mspan初始化时按照elemsize申请空间。其每个
+  // bit位表达一个slot，如果bit位为1，表明这个slot已经被分配，否则slot空闲。
+	allocBits  *gcBits
+	gcmarkBits *gcBits
+
+  // GC相关，暂不讨论
+	divMul      uint16
+	baseMask    uint16
+  // 当前mspan上已经分配的对象数量
+	allocCount  uint16
+  // 当前mspan的sizeClass
+	spanclass   spanClass  // size class and noscan (uint8)
+  // 表明当前mspan是否在mcache中
+	incache     bool
+  // mspan状态，共有四种状态
+  // _MSpanDead、_MSpanInUse、_MSpanManual、_MSpanFree
+	state       mSpanState
+  // 从当前mspan分配对象时，是否需要将对象的内存空间初始化为0
+	needzero    uint8
+	divShift    uint8
+	divShift2   uint8
+  // mspan能分配的对象大小
+	elemsize    uintptr
+  // 当前mspan最近一次使用的nano时间戳，用于判定是否需要向系统归还内存
+	unusedsince int64
+	npreleased  uintptr    // number of pages released to the os
+  // 当前mspan指向空间的结束为止+1字节
+	limit       uintptr
+	speciallock mutex      // guards specials list
+	specials    *special   // linked list of special records sorted by offset.
+}
+```
+
+说到堆内存的管理，mspan是重中之重，它是go内存管理中持有可分配空间的基本单元。
+
+mspan.startAddr指向了当前mspan中的堆内存地址，在mspan的init方法中，实现了对startAddr、npages、state的初始化。
+
+mspan包含四种状态
+
+```go
+type mSpanState uint8
+const (
+  // 当前mspan处于不可用状态
+	_MSpanDead   mSpanState = iota
+  // 当前mspan处于可用状态
+	_MSpanInUse   // allocated for garbage collected heap
+	_MSpanManual  // allocated for manual management (e.g., stack allocator)
+	_MSpanFree
+)
 ```
 
 
