@@ -18,23 +18,29 @@ go的内存管理参考了tcmalloc，tcmalloc是google开源的一款内存管�
 
 ## ptmalloc  vs  tcmalloc  vs  jemalloc
 
-### ptmalloc
 
-ptmalloc是glibc中默认的内存分配器。
-
-### tcmalloc
-
-### jemalloc
 
 # 预备知识
 
 ## 常用全局变量
 
-# 原始堆内存管理
+
+
+# 系统级内存管理
+
+## 原始堆内存的初始化（mallocinit）
 
 操作系统提供的虚拟内存空间，是由寻找空间决定的，在amd64位系统上，有48个bit用于寻址，所以我们的可用地址空间，在1<<48个，这里没有占满64bit，因为48bit已经提供了256TB的虚拟地址寻址空间。这几乎已经足够大部分的系统应用了。
 
-go中共使用了128TB的内存，用于初始化内存分配池
+go在mallocinit中初始化了128个arenahint对象，从0xC000000000开始循环128次，令每个arenahint.addr指向1TB空间的起始地址。作为堆内存的寻址指引。所有在应用程序中通过new关键字创建的对象地址，最终都指向大于0xC000000000的地址。
+
+虽然指定的arenahint链表有128TB空间之大，但堆内存的地址不止如此，后面可以看到当128TB空间耗尽后，arenahint链表还会继续扩张。
+
+选择将堆地址放在0xC000000000的位置，注释阐明了原因。一方面方便调试时识别堆内存空间。另一方面，在用大端法表达地址时，C0不是有效的UTF-8字符，可以一定程度上规避对指针类型被错误解释成UTF8字符。
+
+我们且称这部分128TB的内存为堆原始内存。
+
+
 
 ```go
 func mallocinit() {
@@ -63,6 +69,8 @@ func mallocinit() {
 			hint.next, mheap_.arenaHints = mheap_.arenaHints, hint
 		}
 	} else {
+		// 32位系统的初始化过程
+	}
 ```
 
 
@@ -81,60 +89,17 @@ arenahint指向最原始的虚拟内存空间，runtime.sysAlloc函数分配空�
 
 
 
-# 系统级内存管理
+## Arena
 
-## overview
+### arena
 
-```go
-type mheap struct {
-  // 用于锁住allspans对象
-	lock      mutex
-  // 小于等于128个pageSize的空闲mspan链表数组，按照page数量不同而区分保存
-	free      [_MaxMHeapList]mSpanList
-  // 大于128个pageSize的空闲mspan树堆
-	freelarge mTreap
-  // 使用中的小于等于128个pageSize的mspan链表数组，按照page数量不同区分保存
-	busy      [_MaxMHeapList]mSpanList
-  // 使用中的大于128个pageSize的空闲mspan链表，由于总量不会太大，仅使用一个链表保存
-	busylarge mSpanList
-  
-	// 状态所有mspan对象的slice，用于gc时快速扫描所有已分配的mspan对象。
-	allspans []*mspan // all spans out there
-	
-  // arena描述，heapArena有两个成员，其中heapArena.bitmap是用于标识一个
-  // arena中每一个8byte中是否包含指针，heapArean.spans用于表示当前arena
-  // 下的每一个页被哪个mspan对象所占用。
-  // arenas是一个二维数组，通过这个二维数组，构成了对整个虚拟内存寻址空间的
-  // 描述。在64位系统中，arenaL1Bits为0，arenaL2Bits为22（4MB）。所以
-  // 这里总共有，所以堆中用4MB的空间，描述了整个虚拟内存的使用情况和包含指针
-  // 情况，bitmap会在gc时起到关键作用。
-	arenas [1 << arenaL1Bits]*[1 << arenaL2Bits]*heapArena
+arena是tcmalloc中没有的概念，go中基于垃圾回收的考虑，需要对内存进行更加精细化的管理。所以增加了arena的概念。arena中文翻译是竞技场，没什么卵用。
 
-	// 整个堆内存空间的索引。
-	arenaHints *arenaHint
-
-	// 中央分配器数组，按照sizeClass区分，不同的中央分配器，所能分配的空间大小不同。
-  // pad为了将结构体对齐到cpu的cacheline。
-	central [numSpanClasses]struct {
-		mcentral mcentral
-		pad      [sys.CacheLineSize - unsafe.Sizeof(mcentral{})%sys.CacheLineSize]byte
-	}
-  
-  ...
-}
-```
+go中将arena定义为一段连续的64MB空间。
 
 
 
-### Arena
-
-#### arena
-
-arena是tcmalloc中没有的概念，go中基于垃圾回收的考虑，需要对内存进行更加精细化的管理。所以增加了arena的概念。arena中文翻译是竞技场，没什么卵用。go中将堆内存划分为64MB的块。
-
-
-
-#### heapArena
+### heapArena
 
 ```go
 type heapArena struct {
@@ -158,9 +123,107 @@ type heapArena struct {
 
 heapArena标识一个64MB的arena。整个虚拟内存地址空间，被按照arena管理起来，每64MB对应一个heapArena对象。heapArena对象通过persistentalloc申请，申请的对象被挂到mheap.arenas二级索引下。
 
-mspan相关内容稍后再看。
 
-spanOf - TODO
+
+```go
+type mheap struct {
+	// ...
+  
+	// arenas是一个二维数组，通过这个二维数组，构成了对整个虚拟内存寻址空间的
+	// 描述。在64位系统中，arenaL1Bits为0，arenaL2Bits为22（4MB）。
+  // 堆中用了4MB的空间，描述了整个虚拟内存的使用情况和包含指针情况。
+	arenas [1 << arenaL1Bits]*[1 << arenaL2Bits]*heapArena
+  
+	// ...
+}
+```
+
+在mheap类中的arenas成员使用一个二维指针表达了整个虚拟内存空间。并提供了一些方法来操作这个空间。比如根据指针值，计算出其对应的heapArena对象。
+
+
+
+### 根据指针值计算heapArena
+
+arenas中，arenaL1Bits、arenaL2Bits分别表达了第一维和第二维的bit shift，在64位系统上，arenaL1Bits为0，arenaL2Bits为22。所以最多会有4MB个heapArena对象。由于每个heapArena对象都表达了64MB的虚拟内存空间，所以4MB * 64MB = 1 << 48，arenas就覆盖了整个虚拟内存空间。
+
+对于一个给定的地址p，共有48个bit位为有效地址bit，其前arenaL1Bits位bit作为第一维索引，这里为0。所以前arenaL2Bits位bit作为第二维索引，这里为22。go使用arenaIndex来计算p对应的heapArena对象在arenas二维数组中的位置。
+
+```go
+func arenaIndex(p uintptr) arenaIdx {
+  // p加上arenaBaseOffset，除以arena的大小，得到一个index值。
+	// arenaBaseOffset用于将
+	return arenaIdx((p + arenaBaseOffset) / heapArenaBytes)
+}
+
+type arenaIdx uint
+
+// 获得前arenaL1Bits位作为L1索引
+func (i arenaIdx) l1() uint {
+	if arenaL1Bits == 0 {
+		return 0
+	} else {
+		return uint(i) >> arenaL1Shift
+	}
+}
+
+// 获得从l1 index开始的arenaL2Bits位，作为L2索引
+func (i arenaIdx) l2() uint {
+	if arenaL1Bits == 0 {
+		return uint(i)
+	} else {
+		return uint(i) & (1<<arenaL2Bits - 1)
+	}
+}
+```
+
+前面我们提到过，系统上寻址空间为48位。而指针变量为64位。
+
+amd在设计64位系统的虚拟内存空间时，对地址定义做了如下限制：即要求指针值的48-63位，必须要与第47位一致，否则访存时会触发异常。扩展：[虚拟内存地址空间](https://zh.wikipedia.org/wiki/X86-64)
+
+根据这一规则，go中将index的计算进行了特殊处理，即向地址追加一个0x800000000000的arena基址再计算index，这会产生如下效果：
+
+对于小于等于0x7FFFFFFFFFFF的地址，追加arena基址后，获得的arenaIndex位于arenas二维数组的后半部分。
+
+对于大于0x7FFFFFFFFFFF的地址，追加arena基址后，触发了地址值的溢出，因此获得的arenaIndex位于arenas二位数组的前半部分。
+
+
+
+### 如何判定内存是否在堆上
+
+go堆中的内存，所有已分配的空间是由称作mspan类型的对象来持有并管理的，在原始虚拟内存中，mallocinit初始化时限定了堆内存的绝对分配范围，mheap通过heapArena对所有的堆内存进行了划分，而heapArena中的spans成员又保存了64MB的空间下每个物理页归属的mspan对象。所以只要是有效的堆内存地址，都可以唯一地映射到一个heapArena对象上。也可以直接映射到一个mspan对象上。
+
+go提供了几个方法来查找指针对应的heapArena对象。
+
+
+
+```go
+func spanOf(p uintptr) *mspan {
+	ri := arenaIndex(p)
+	if arenaL1Bits == 0 {
+		if ri.l2() >= uint(len(mheap_.arenas[0])) {
+			return nil
+		}
+	} else {
+		if ri.l1() >= uint(len(mheap_.arenas)) {
+			return nil
+		}
+	}
+	l2 := mheap_.arenas[ri.l1()]
+	if arenaL1Bits != 0 && l2 == nil {
+		return nil
+	}
+	ha := l2[ri.l2()]
+	if ha == nil {
+		return nil
+	}
+	return ha.spans[(p/pageSize)%pagesPerArena]
+}
+
+// 如果p不在有效堆内存范围内，则返回nil
+func spanOfHeap(p uintptr) *mspan
+```
+
+如果一个虚拟内存地址没有在go中被分配过，则其地址对应的heapArena指针为空。
 
 
 
@@ -187,7 +250,7 @@ func sysUnused(v unsafe.Pointer, n uintptr)
 
 
 
-### 小内存非堆分配器 - persistentalloc
+### 小内存非堆分配方法
 
 全局小内存块申请方法。该方法传入一个需求大小和对齐大小、返回一个指针，指向申请的空间起始地址。其中align必须是2的指数倍且小于pageSize。
 
@@ -244,19 +307,24 @@ func persistentalloc1(size, align uintptr, sysStat *uint64) *notInHeap {
 
 这段代码申请了一个满足size需求的空间。align会被对齐到2的指数倍。
 
-如果size大于64kb，则直接调用系统mmap分配空间。
+- 如果size大于64kb，则直接调用系统mmap分配空间。
 
-如果size小于64kb，找到当前m对象下的persistentAlloc对象，在其偏移位上分配一个size的空间。并返回。
+- 如果size小于64kb，找到当前m对象下的persistentAlloc对象，在其偏移位上分配一个size的空间。并返回。
 
-如果persistentAlloc对象已经不足以分配该size的内存。则直接分配一个新的chunk，令m的persistentAlloc.base指向该chunk。
+- 如果persistentAlloc对象已经不足以分配该size的内存。则直接分配一个新的chunk，令m的persistentAlloc.base指向该chunk。
 
 
 
-persistentAlloc对象有全局和m局部之分。全局persistentAlloc对象包含一个全局锁，用于没有m的分配场景。
 
-注意persistentalloc1方法返回的是一个notInHeap指针，表明了该方法申请的内存不是在go划分的堆内存以内申请的。实际上chunk分配在哪儿，由于调用的是sysAlloc方法，所以实际内存在什么位置由操作系统指定。
+go运行时有一种叫m的对象，用于表达一个系统工作线程及其状态。为了加速小内存的线程内快速分配，避免因向堆内存申请空间导致的锁竞争，所以为每个m对象指定了一个persistentAlloc，用于加速县城局部小内存分配速度。同时，runtime中也创建了一个全局带锁的persistentAlloc对象，用于go运行时小内存分配。
+
+persistentalloc调用了persistentalloc1方法。
+
+persistentalloc1方法返回的是一个notInHeap指针，表明了该方法申请的内存不是在go划分的原始堆内存以内申请的。实际上由于调用的是sysAlloc方法，所以chunk分配在哪儿、实际内存在什么位置由操作系统决定。
 
 persistentalloc1分配的内存不提供释放方法。这是由于该方法申请的空间在上层大多提供对象池实现，所以总体上来说其已分配的内存是收敛的。
+
+【图：小内存分配的图例】
 
 
 
@@ -271,7 +339,7 @@ type persistentAlloc struct {
 
 
 
-### 堆内存分配器 - mheap.sysAlloc
+### 堆原始内存分配器
 
 sysAlloc只有在堆增长（mheap.grow）的时候才会被调用。
 
@@ -287,7 +355,12 @@ func (h *mheap) sysAlloc(n uintptr) (v unsafe.Pointer, size uintptr) {
 		if hint.down {
 			p -= n
 		}
-    if...{
+
+		if p+n < p {
+			v = nil
+		} else if arenaIndex(p+n-1) >= 1<<arenaBits {
+			v = nil
+		} else {
 			// 预留当前空闲的地址空间
 			v = sysReserve(unsafe.Pointer(p), n)
 		}
@@ -307,27 +380,25 @@ func (h *mheap) sysAlloc(n uintptr) (v unsafe.Pointer, size uintptr) {
 		h.arenaHints = hint.next
 		h.arenaHintAlloc.free(unsafe.Pointer(hint))
 	}
+	if size == 0 {
+    // 一般应用程序不会执行到这里，因为这表明256TB的原始堆空间都已经分配殆尽
+		// ...
+    // 向系统申请任意起始地址的空间，对齐到heapArenaBytes。
+		v, size = sysReserveAligned(nil, n, heapArenaBytes)
+		if v == nil {
+			return nil, 0
+		}
+
+		// 创建新的areanHint并添加到列表
+		hint := (*arenaHint)(h.arenaHintAlloc.alloc())
+		hint.addr, hint.down = uintptr(v), true
+		hint.next, mheap_.arenaHints = mheap_.arenaHints, hint
+		hint = (*arenaHint)(h.arenaHintAlloc.alloc())
+		hint.addr = uintptr(v) + size
+		hint.next, mheap_.arenaHints = mheap_.arenaHints, hint
+	}
+
 	// ...
-
-	// 检查指针合法性
-	{
-		var bad string
-		p := uintptr(v)
-		if p+size < p {
-			bad = "region exceeds uintptr range"
-		} else if arenaIndex(p) >= 1<<arenaBits {
-			bad = "base outside usable address space"
-		} else if arenaIndex(p+size-1) >= 1<<arenaBits {
-			bad = "end outside usable address space"
-		}
-		if bad != "" {
-			// ...
-		}
-	}
-
-	if uintptr(v)&(heapArenaBytes-1) != 0 {
-		throw("misrounded allocation in sysAlloc")
-	}
 
 	// 将前面预留的空间重新映射回来。
 	sysMap(v, size, &memstats.heap_sys)
@@ -335,7 +406,8 @@ func (h *mheap) sysAlloc(n uintptr) (v unsafe.Pointer, size uintptr) {
 mapped:
 	// Create arena metadata.
 	for ri := arenaIndex(uintptr(v)); ri <= arenaIndex(uintptr(v)+size-1); ri++ {
-		// ...更新mheap.arenas对象，增加对当前申请空间的描述heapArena对象。
+		// ...
+		// 更新mheap.arenas对象，增加对当前申请空间的描述heapArena对象。
 		atomic.StorepNoWB(unsafe.Pointer(&l2[ri.l2()]), unsafe.Pointer(r))
 	}
 	...
@@ -346,9 +418,15 @@ mapped:
 
 sysAlloc通过hints，从原始规划的堆空间申请一段符合需求量n的内存，返回其空间起始地址和实际mmap的内存大小。所有基于堆内存的分配，最终都指向了sysAlloc方法，这也是操作hints表达的堆内存的唯一途径。
 
+【图：堆原始内存分配器的工作方式】
 
 
-### 定长对象分配器 - fixalloc
+
+### 定长对象分配器
+
+对于一些运行时常驻内存的，且有缓存的固定长度对象，比如mspan，go中设计了固定长度对象分配器。由于这类内存需求长度固定易于管理，且需求空间较小，所以没有使用堆原始内存分配器。
+
+
 
 ```go
 type fixalloc struct {
@@ -369,6 +447,7 @@ type fixalloc struct {
   // 是否需要将新申请的对象空间置为0
 	zero   bool
 }
+
 type mlink struct {
   // 空闲对象链表指针，空闲的对象的内存是随机值，它的地址空间会被临时视为一个mlink对象
   // 用于构建空闲对象内存链表。当一块空闲对象被分配时，mlink空间被覆盖。
@@ -376,7 +455,9 @@ type mlink struct {
 }
 ```
 
-定长对象分配器不属于基本的内存分配器，但在堆中经常会用到。其实现也很简单
+定长对象分配器不属于基本的内存分配器，但在堆中经常会用到。其内存的分配和释放实现也很简单
+
+
 
 ```go
 func (f *fixalloc) alloc() unsafe.Pointer {
@@ -421,9 +502,9 @@ func (f *fixalloc) free(p unsafe.Pointer) {
 }
 ```
 
-堆中管理了六类对象的fixalloc，后面会分别介绍。定长分配器中调用了persistentalloc来申请非堆小内存。
 
 
+下面的代码说明了堆对象中的6中定长分配器
 
 ```go
 type mheap struct {
@@ -443,17 +524,30 @@ type mheap struct {
 }
 ```
 
-mheap对象中的六个定长对象分配器
-
 
 
 ## summary
 
-malloc.go中通过以上方法实现了虚拟内存的分配管理。对于小块的内存分配，通过在m对象中缓存256kb的chunk来实现线程局部的快速分配。对于大内存，则直接在hint指向的内存上，以64MB对齐的方式分配整块的内存空间，而这部分空间的精细管理，则由更新粒度的对象完成。
+malloc.go中通过以上方法实现了虚拟内存的分配管理。对于小块的内存分配，通过在m对象中缓存256kb的chunk来实现线程局部的快速分配。对于大内存，则直接在hint指向的原始堆内存上，以64MB对齐的方式分配整块的内存空间，而这部分空间的精细管理，则由更新粒度的对象完成。
 
 
 
 # mheap
+
+堆作为运行时的动态内存分配器，主要需要解决以下问题：
+
+1. 如何快速有效的响应内存分配的需求。
+2. 如果避免内存碎片的产生。
+
+go中通过以下途径，来解决上面的问题
+
+1. 缓存已申请但未分配的内存。
+2. 将缓存的内存块按照大小分开管理。
+3. 将不需要被GC扫描的内存分开管理。
+4. 将释放的连续内存合并。
+5. 为每个线程建立独立的内存分配器。
+
+
 
 堆中的内存以物理页（page）为单位进行管理。当前go中定义的物理页大小为8KB
 
@@ -485,9 +579,9 @@ large（大于32KB字节的空间）
 
 go中为了避免内存碎片，加速小内存的分配效率。对小内存进行了更细粒度的划分。
 
-go将小于等于32KB的内存，划分了67个级别。每个级别对应的内存块大小保存在class_to_size数组中。以class_to_size[4]为例，其值为32，即如果我们为一个大小为18字节的对象分配空间时，实际runtime中，会对齐到class_to_size[4]的32字节来申请空间。
+go将小于等于32KB的内存，划分了67个级别，称之为sizeClass。每个级别对应的内存块大小保存在class_to_size数组中。以class_to_size[4]为例，其值为32，即如果我们为一个大小为18字节的对象分配空间时，实际runtime中，会对齐到class_to_size[4]的32字节来申请空间。
 
-这种对小内存的管理方式，为我们实现不同大小对象之间无干扰的分配提供了可能。代价则是会损失一部分的空间。在sizeclasses.go中给出了各个sizeClass可能浪费的最大空间。
+这种对小内存的管理方式，为我们实现不同大小对象之间无干扰的分配提供了可能。代价则是会损失一部分的空间。在sizeclasses.go的注释中给出了各个sizeClass可能浪费的最大空间。
 
 至于为什么是67，这可能是相对准备32768个不同大小的分配器 和 过分离散的class导致的性能降低之间的一个折中。
 
@@ -502,7 +596,7 @@ const (
 
 // 67种sizeclass对应的分配空间大小
 var class_to_size = [_NumSizeClasses]uint16{...}
-// 67种sizeclass对应的应分配的系统页数量
+// 67种sizeclass对应的分配器应持有的系统页数量，被mcentral使用
 var class_to_allocnpages = [_NumSizeClasses]uint8{...}
 // 小于1024字节的任意空间大小对应的sizeclass
 var size_to_class8 = [smallSizeMax/smallSizeDiv + 1]uint8{...}
@@ -563,7 +657,7 @@ type mspan struct {
 	allocCount  uint16
   // 当前mspan的sizeClass
 	spanclass   spanClass  // size class and noscan (uint8)
-  // 表明当前mspan是否在mcache中
+  // 表明当前mspan是否被mcache缓存
 	incache     bool
   // mspan状态，共有四种状态
   // _MSpanDead、_MSpanInUse、_MSpanManual、_MSpanFree
@@ -584,13 +678,11 @@ type mspan struct {
 }
 ```
 
-说到堆内存的管理，mspan是重中之重，它是go内存管理中持有可分配空间的基本单元。
+堆中无论是空闲与使用中的内存，都可以用mspan对象来表达。mspan中持有系统页整数倍的内存空间。通过一个状态标记来标识当前mspan是被使用中还是空闲中。
 
-mspan.startAddr指向了当前mspan中的堆内存地址，在mspan的init方法中，实现了对startAddr、npages、state的初始化。
+mspan中持有的空间，可用来分配一个或多个相同类型的对象空间，elemsize表明了对象类型占用的空间大小。nelems表明了当前mspan下可以分配对象的最大数量。
 
-mspan中持有的空间，可用来分配一个或多个相同类型的对象空间，elemsize表明了对象类型占用的空间大小。nelems表明了当前mspan下可以保存的对象数量。
 
-mspan包含四种状态 TODO详细描述四种状态
 
 在堆中，mspan会通过一个包含头尾指针的mSpanList和prev、next指针串联成为一个双向链表。mSpanList结构如下：
 
@@ -621,9 +713,17 @@ type mheap struct {
 }
 ```
 
+mheap中使用4个数据结构表达了当前已经缓存的原始堆内存。
+
+用于分配tiny和small对象空间的mspan，通过free、busy链表数组来记录
+
+用于分配large对象空间的mspan，通过freelarge树堆、busylarge链表来记录
+
+
+
 ### 小内存
 
-对于用于分配tiny和small对象空间的mspan，堆中通过free、busy来保存。free和busy是一个mSpanList链表数组，数组大小为128，用于分别对应持有1-128个系统页pages空间的mspan对象。free保存了当前处于空闲状态的mspan，而busy保存了当前使用中的mspan。
+free和busy是一个mSpanList链表数组，数组大小为128，用于分别对应持有1-128个系统页pages空间的mspan对象链表头。free保存了当前处于空闲状态的mspan，而busy保存了当前使用中的mspan。
 
 
 
@@ -640,11 +740,7 @@ priority值在树节点被插入时由当前m对象的fastrand随机种子生成
 
 TODO：补充树堆插入查找删除时间空间复杂度
 
-使用中的大内存对象，则保存在busylarge中。
 
-
-
-#### 如何判定一段内存是否在堆内TODO
 
 ## 堆增长
 
@@ -670,9 +766,9 @@ func (h *mheap) grow(npage uintptr) bool {
 }
 ```
 
-堆增长函数调用了此前讨论的系统原始内存分配方法mheap.sysAlloc来分配mspan底层内存。将其状态设置为_MSpanInUse，并调用了freeSpanLocked。
+堆增长函数调用了此前讨论的系统原始内存分配方法mheap.sysAlloc来分配堆内存。将其状态设置为_MSpanInUse，并调用freeSpanLocked将未使用到的空间放到空闲内存池中。
 
-内存碎片的规避，除了通过内存池的方式分配小内存外，还要在内存被归还时尽可能的将连续的空闲内存块合并成更大的空间，以期未来分配过程中有跟大的内存可以被使用。go中通过检查当前mspan空间的和其连续空间的前后mspan是否都处于_MSpanFree状态来决定是否要合并这些mspan。
+栈增长的大小是没有固定数量的，但是在sysAlloc中，会被对齐到64MB进行申请。
 
 
 
@@ -680,12 +776,22 @@ func (h *mheap) grow(npage uintptr) bool {
 
 堆内存的分配释放主要通过allocSpanLocked和freeSpanLocked完成。
 
+在freeSpanLocked过程中，通过检查当前mspan空间的和其连续空间的前后mspan是否都处于_MSpanFree状态，决定是否要合并这些mspan。
+
+alloc优先从已分配堆内存中进行分配，如果没有合适的堆内存块（mspan），则触发堆增长，并再次申请。
+
+free将内存块归还到已分配堆内存队列中。
+
+
+
+### allocSpanLocked（分配）
+
 ```go
 func (h *mheap) allocSpanLocked(npage uintptr, stat *uint64) *mspan {
 	var list *mSpanList
 	var s *mspan
 
-	// 如果npage小于128，则优先从mheap.free中获取满足npage数量的mspan
+	// 如果需求page数量小于128，则优先从mheap.free中获取满足npage数量的mspan
 	for i := int(npage); i < len(h.free); i++ {
 		list = &h.free[i]
 		if !list.isEmpty() {
@@ -736,13 +842,97 @@ HaveSpan:
 }
 ```
 
+在堆中的所有mspan对象，都是从allocSpanLocked创建的。
+
+
+
+### freeSpanLocked（释放）
+
+```go
+func (h *mheap) freeSpanLocked(s *mspan, acctinuse, acctidle bool, unusedsince int64) {
+  // ...
+
+	// 将mspan从使用中列表脱链，修改状态为空闲状态
+	s.state = _MSpanFree
+	if s.inList() {
+		h.busyList(s.npages).remove(s)
+	}
+
+	// 如果与s连续内存的低地址方向也是一个已分配的空闲的mspan，则合并s和before
+	// 两个mspan
+	if before := spanOf(s.base() - 1); before != nil && before.state == _MSpanFree {
+		s.startAddr = before.startAddr
+		s.npages += before.npages
+		s.npreleased = before.npreleased
+		s.needzero |= before.needzero
+		h.setSpan(before.base(), s)
+
+		// 从空闲列表中移除before mspan
+		if h.isLargeSpan(before.npages) {
+			h.freelarge.removeSpan(before)
+		} else {
+			h.freeList(before.npages).remove(before)
+		}
+    // 释放before mspan对象，归还到spanalloc固定对象分配器中
+		before.state = _MSpanDead
+		h.spanalloc.free(unsafe.Pointer(before))
+	}
+
+	// 与before一样
+	if after := spanOf(s.base() + s.npages*pageSize); after != nil && after.state == _MSpanFree {
+		s.npages += after.npages
+		s.npreleased += after.npreleased
+		s.needzero |= after.needzero
+		h.setSpan(s.base()+s.npages*pageSize-1, s)
+		if h.isLargeSpan(after.npages) {
+			h.freelarge.removeSpan(after)
+		} else {
+			h.freeList(after.npages).remove(after)
+		}
+    // 释放before mspan对象，归还到spanalloc固定对象分配器中
+		after.state = _MSpanDead
+		h.spanalloc.free(unsafe.Pointer(after))
+	}
+
+	// 将前后合并后的s放到空闲mspan列表中。
+	if h.isLargeSpan(s.npages) {
+    // 如果是大于1MB的mspan，则插入到树堆中
+		h.freelarge.insert(s)
+	} else {
+		// 如果是小于1MB的mspan，则插入到指定page数量的mspan链表中
+		h.freeList(s.npages).insert(s)
+	}
+}
+```
+
+在busy列表中查找使用中的mspan，时间复杂度为常数级。
+
+
+
+## mcentral
+
+```go
+type mcentral struct {
+	// 互斥锁，用于保护nonempty和empty链表
+	lock      mutex
+	// 当前mcentral对象的spanClass
+	spanclass spanClass
+	// 空闲mspan链表
+	nonempty  mSpanList
+	// 使用中mspan链表
+	empty     mSpanList
+	// 
+	nmalloc uint64
+}
+```
+
 
 
 ## mcache
 
-## mcentral
-
 ## mallocgc
+
+
 
 # 其他
 
@@ -768,87 +958,7 @@ heap每次grow都会创建一个新的span，新申请空间在heap层对齐到p
 
 mheap提供的allocSpanLocked方法首先检查需要多大page数量的空间，如果需要的pages数量小于128个，则在mheap.free中申请，如果在mheap.free中没有找到可用空间，或需要空间大于128个page，则在mtreap中申请空间。如果mtreap中也没有足够的mspan。则调用mheap.grow从原始堆空间申请。注意申请完的堆内存，并不进入到mheap.free或mheap.mtreap，而是构建新的span对象直接返回。由于原始堆中是以64MB的arena为单位申请空间的，需求mspan大小很可能远低于这个值。这种情况下，原始堆内存被分割成两个mspan，一个进入到堆的
 
-### fixalloc
 
-固定长度对象分配器池
-
-```go
-type fixalloc struct {
-	size   uintptr		// 单个对象大小
-	first  func(arg, p unsafe.Pointer) // 回调函数
-	arg    unsafe.Pointer	// 回调函数参数指针
-	list   *mlink		// fixalloc已经分配的对象的缓存链表，调用fixalloc.free被归还回来的对象，会被加入到list里面。
-	chunk  uintptr 		// 对象空间地址空间，大小为nchunk。use uintptr instead of unsafe.Pointer to avoid write barriers
-	nchunk uint32		// 固定为_FixAllocChunk，即（16 << 10 = 16KB），一次从系统申请固定nchunk长度的空间
-	inuse  uintptr 		// 当前chunk使用中的内存量
-	stat   *uint64		// 全局mstats的统计计数变量
-	zero   bool 		// 是否需要置0初始化
-}
-```
-
-用于分配固定长度的对象，在初始化时传入单个对象的大小保存到size成员，此后每次分配内存都按照size来分配。归还回来的对象会以链表节点的形式添加到list链表中。
-fixalloc依赖persistentalloc方法实现扩张，每当list中没有空闲对象可以使用时，便调用persistentalloc申请一个16KB的chunk。所以fixalloc申请的对象，也不在堆上管理。
-
-mheap对象中持有六个fixalloc对象，名称和作用如下：
-**spanalloc**:用于分配和管理mspan对象
-**cachealloc**:用于分配和管理mcache对象
-**treapalloc**:用于分配和管理treapNodes对象
-**specialfinalizeralloc**:TODO
-**specialprofilealloc**:TODO
-**arenaHintAlloc**:用于分配和管理arenaHint对象
-
-
-
-### mheap again
-
-为了方便介绍堆内存的管理机制，这里需要先简要介绍一下mheap对象中的主要数据成员
-
-```go
-//go:notinheap
-type mheap struct {
-	lock      mutex
-	free      [_MaxMHeapList]mSpanList		// 管理小于128个page的空闲mspan链表的数组
-	freelarge mTreap					// 管理大于128个page的空闲mspan树堆
-	busy      [_MaxMHeapList]mSpanList 	// 管理正在使用中的小于128个page的mspan链表的数组
-	busylarge mSpanList                			// 管理正在使用中的大于128个page的mspan链表
-	....	
-}
-```
-
-
-
-根据前面叙述，一个mspan可能指向一个或多个page，在mheap中，free成员保存了空闲的、未被使用的mspan，它维护了一个大小为128的mSpanList链表数组。数组中每个成员，对应了拥有其索引值+1个page的mspan链表的头指针。由于堆上内存块申请都是对齐到page的，所以这种对mspan的管理方式，可以让分配器快速找到当前需要page数量的空闲mspan对象。
-
-同理，对于已经被申请使用的mspan，mheap使用busy成员来保存这些mspan。
-
-
-
-#### mTreap
-
-```go
-//go:notinheap
-type mTreap struct {
-	treap *treapNode	// 树堆根节点
-}
-
-//go:notinheap
-type treapNode struct {
-	right     *treapNode 	// 右子树；all treapNodes > this treap node
-	left      *treapNode 	// 左子树；all treapNodes < this treap node
-	parent    *treapNode 	// 父节点；direct parent of this node, nil if root
-	npagesKey uintptr    	// 当前节点mspan占用的page数量；number of pages in spanKey, used as primary sort key
-	spanKey   *mspan    	// mspan指针；span of size npagesKey, used as secondary sort key
-	priority  uint32     	// 平衡系数；random number used by treap algorithm to keep tree probabilistically balanced
-}
-```
-
-
-
-mTreap是一个排序的AVL树。每个节点保存了一个mspan对象。mTreap采用mspan的page数量作为排序依据。左子树为page数量小于根的节点，右子树为page数量大于根的节点。除page数外，如果两个节点的page数量相同，则secondary排序依据是mspan的地址。
-树节点还有一个priority属性，是一个随机数生成的平衡系数。mTreap中保证任一节点的priority必然比他的左右子节点要小。这里通过rotateLeft和rotateRight两个函数实现了树的旋转。
-mTreap提供一个insert方法用于插入mspan。并提供了两个方法用于获取并删除mspan。其中removeSpan传入一个mspan指针，含有该指针的节点会被从mTreap中移除。而remove则传入一个page数量，用于获取最小可以容纳该page数量的mspan指针，并从mTreap中移除该节点。
-以上，mTreap就构成了go中大内存（大于128page）的空闲内存管理。
-对于非空闲的大内存，没有使用mTreap，参见mheap中的busylarge，是mspan链表来实现的。
 
 ##### 小常识
 
@@ -867,24 +977,6 @@ mspan双向链表，提供了insert和insertBack，分别用于插入一个mspan
 值得注意的是，mSpanList并没有依据mspan指向空间的大小来管理mspan，这是因为使用mSpanList的地方，往往是根据mspan拥有空间的大小来分别创建不同的mSpanList的。
 
 
-##### mspan的产生
-
-mspan产生于mheap的grow方法。当上层调用allocSpanLocked方法时，是在请求一个满足需求page数量的mspan。mheap会优先在mTreap中查找，如果没有就会grow申请空间，并新建一个mspan指向这个空间。新建的mspan被加入到mTreap中，allocSpanLocked会再次向mTreap申请mspan，这次必然会申请到该刚申请的mspan。
-mspan的产生过程详细描述TODO
-
-##### sizeClass
-
-见sizeclasses.go。
-在向系统申请空间时，由于对齐的需要，实际申请的空间往往大于我们需要的空间。对于内存管理，大段内存往往是以page来对齐的。但是小内存申请对齐到page浪费太大。应该以更小的单元来申请小内存。所以在以page为单位的mspan基础上，GO将0-32KB的小内存申请进行了划分。所有0-32KB的小内存申请，对齐到了67个离散的class中。
-class_to_size定义了这67个class对应的内存分块大小。索引是class，值是size，这里的值是申请小对象的实际申请空间。
-内存分配期间，我们持有的往往是大小，而不是sizeClass，所以，还需要将要申请的空间大小，对应到sizeClass上。size_to_class8和size_to_class128两个数组实现了这样的映射。
-
-回顾一下内存分配的大小划分：
-tiny - 小于16字节的空间，且没有指针不需要被扫描的
-small - 0 - 32KB的空间
-large - 大于32KB的空间
-
-所有的tiny、small都是通过mcache对象来分配的，而所有的large都是通过直接在arena上分配新的mspan来实现的
 
 ### mheap again & again
 
