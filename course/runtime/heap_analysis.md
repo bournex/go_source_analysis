@@ -89,6 +89,8 @@ arenahint指向最原始的虚拟内存空间，runtime.sysAlloc函数分配空�
 
 【图：arenaHints示意图】
 
+![arenaHints](https://github.com/bournex/go_source_analysis/images/goheap-arenahint.jpg)
+
 
 
 ## Arena
@@ -142,9 +144,7 @@ type mheap struct {
 
 在mheap类中的arenas成员使用一个二维指针表达了整个虚拟内存空间。并提供了一些方法来操作这个空间。比如根据指针值，计算出其对应的heapArena对象。
 
-
-
-【图：heapArena示意图】
+![](https://github.com/bournex/go_source_analysis/images/goheap-heapArena.jpg)
 
 
 
@@ -228,13 +228,13 @@ func spanOf(p uintptr) *mspan {
 func spanOfHeap(p uintptr) *mspan
 ```
 
-如果一个虚拟内存地址没有在go中被分配过，则其地址对应的heapArena指针为空。
+如果一段arena虚拟内存地址没有在go中被分配过，则其地址对应的heapArena指针为空。
 
 
 
 ## 内存分配核心方法
 
-malloc.go中提供了几个主要的内存分配方法。这些方法实现了对操作系统虚拟内存空间的分配。通常来说这些方法不提供内存的释放。因为在malloc.go基础上的mheap对象实现了大部分内存的复用。
+malloc.go中提供了几个主要的内存分配方法。这些方法实现了对操作系统虚拟内存空间的分配。通常来说这些方法不提供内存的释放。因为在malloc.go基础上，runtime实现了大部分内存的复用。
 
 
 
@@ -272,7 +272,7 @@ func persistentalloc1(size, align uintptr, sysStat *uint64) *notInHeap {
 
 	// ...将align对齐到2的指数倍
 
-	// 大于64KB直接分配
+	// 大于64KB直接向操作系统申请
 	if size >= maxBlock {
 		return (*notInHeap)(sysAlloc(size, sysStat))
 	}
@@ -318,12 +318,12 @@ func persistentalloc1(size, align uintptr, sysStat *uint64) *notInHeap {
 
 - 如果size小于64kb，找到当前m对象下的persistentAlloc对象，在其偏移位上分配一个size的空间。并返回。
 
-- 如果persistentAlloc对象已经不足以分配该size的内存。则直接分配一个新的chunk，令m的persistentAlloc.base指向该chunk。
+- 如果persistentAlloc对象已经不足以分配该size的内存。则直接分配一个新的256KB的chunk，令m的persistentAlloc.base指向该chunk。
 
 
 
 
-go运行时有一种叫m的对象，用于表达一个系统工作线程及其状态。为了加速小内存的线程内快速分配，避免因向堆内存申请空间导致的锁竞争，所以为每个m对象指定了一个persistentAlloc，用于加速县城局部小内存分配速度。同时，runtime中也创建了一个全局带锁的persistentAlloc对象，用于go运行时小内存分配。
+go运行时有一种叫m的对象，用于表达一个系统工作线程及其状态。为了加速小内存的线程内快速分配，避免因向堆内存申请空间导致的锁竞争，所以为每个m对象指定了一个persistentAlloc，用于加速线程局部小内存分配速度。同时，runtime中也创建了一个全局带锁的persistentAlloc对象，用于go运行时小内存分配。
 
 persistentalloc调用了persistentalloc1方法。
 
@@ -561,64 +561,9 @@ go中通过以下途径，来解决上述问题
 
 以128个物理页（1MB）为界。
 
-占用物理页大于128个的，按小内存处理
+占用物理页大于128个的，按小对象处理
 
-占用物理页大于等于128个的，按大内存处理
-
-
-
-TODO 移动以下内容到更细粒度的分配介绍中
-
-对于更细粒度的对象，首先需要明确对象大小的划分，在runtime中，对象按大小被分为三类。
-
-tiny（小于等于16字节的空间）
-
-small（小于等于32KB字节的空间）
-
-large（大于32KB字节的空间）
-
-每种类型都有不同的管理和分配方式。
-
-
-
-## sizeClass
-
-在内存管理中，大块内存比较容易管理，小块内存则是产生内存碎片的祸根。如果任由小块内存在系统中随机分配，最终可能会出现无法申请连续大块内存的情况。
-
-go中为了避免内存碎片，加速小内存的分配效率。对小内存进行了更细粒度的划分。
-
-go将小于等于32KB的内存，划分了67个级别，称之为sizeClass。每个级别对应的内存块大小保存在class_to_size数组中。以class_to_size[4]为例，其值为32，即如果我们为一个大小为18字节的对象分配空间时，实际runtime中，会对齐到class_to_size[4]的32字节来申请空间。
-
-这种对小内存的管理方式，为我们实现不同大小对象之间无干扰的分配提供了可能。代价则是会损失一部分的空间。在sizeclasses.go的注释中给出了各个sizeClass可能浪费的最大空间。
-
-至于为什么是67，这可能是相对准备32768个不同大小的分配器 和 过分离散的class导致的性能降低之间的一个折中。
-
-```go
-const (
-	_MaxSmallSize   = 32768
-	smallSizeDiv    = 8
-	smallSizeMax    = 1024
-	largeSizeDiv    = 128
-	_NumSizeClasses = 67
-)
-
-// 67种sizeclass对应的分配空间大小
-var class_to_size = [_NumSizeClasses]uint16{...}
-// 67种sizeclass对应的分配器应持有的系统页数量，被mcentral使用
-var class_to_allocnpages = [_NumSizeClasses]uint8{...}
-// 小于1024字节的任意空间大小对应的sizeclass
-var size_to_class8 = [smallSizeMax/smallSizeDiv + 1]uint8{...}
-// 大于1024、小于32768字节的任意空间大小对应的sizeclass
-var size_to_class128 = [(_MaxSmallSize-smallSizeMax)/largeSizeDiv + 1]uint8{...}
-```
-
-
-
-## spanClass
-
-spanClass是sizeClass的一种特殊表达，它将sizeClass的索引（即0-66）左移一位，低位用于表达noscan标记。如果最低位为1，表示不需要GC扫描该spanClass下的对象。
-
-go在编译期间，可以通过代码的AST分析可以得出内存分配的类型，以及类型中是否包含指针类型。这是对象是否需要被GC扫描的重要依据。当runtime进行内存分配时，可以通过将需要扫描的和不需要扫描的对象分开管理申请和释放。提升无指针类型申请和释放的效率。
+占用物理页大于等于128个的，按大对象处理
 
 
 
@@ -644,9 +589,7 @@ type mspan struct {
 	nelems uintptr
 
 	// 作为当前allocBits的一个滑动窗口，用于快速计算当前的可用空间。
-  // why？因为mspan中的空间，有申请就有释放。之前申请的空间释放后，就会产生类似
-  // 碎片的东东。所以仅通过一个index是无法表达这些空闲碎片的。
-  // allocCache的64个bit位，表达了64个slot。初始化为^0
+  // allocCache的64个bit位，表达了64个slot。初始化为^0。
   // 应用中，go通过德布鲁因算法快速获得当前allocCache中bit为1的最低位，作为
   // freeindex的补充，通过freeindex+lowbit(allocCache)获得当前空闲的slot。
   // 
@@ -663,8 +606,8 @@ type mspan struct {
 	baseMask    uint16
   // 当前mspan上已经分配的对象数量
 	allocCount  uint16
-  // 当前mspan的sizeClass
-	spanclass   spanClass  // size class and noscan (uint8)
+  // 当前mspan的spanClass
+	spanclass   spanClass
   // 表明当前mspan是否被mcache缓存
 	incache     bool
   // mspan状态，共有四种状态
@@ -692,7 +635,13 @@ mspan中持有的空间，可用来分配一个或多个相同类型的对象空
 
 
 
-在堆中，mspan会通过一个包含头尾指针的mSpanList和prev、next指针串联成为一个双向链表。mSpanList结构如下：
+mspan在mheap、mcentral、mcache中都有缓存，与mcentral、mcache不同的是，在mheap中缓存的mspan对象是以page为单位的，npages表明了mheap中的mspan对象所持有的系统页数量，其spanclass成员为0。
+
+
+
+在堆中，mspan会通过一个包含头尾指针的mSpanList和prev、next指针串联成为一个双向链表。
+
+mSpanList结构如下：
 
 ```go
 type mSpanList struct {
@@ -703,9 +652,7 @@ type mSpanList struct {
 
 
 
-
-
-## 已分配堆内存管理
+## 堆缓存管理
 
 ```go
 type mheap struct {
@@ -786,8 +733,8 @@ func (h *mheap) grow(npage uintptr) bool {
 
 堆内存的分配释放主要通过allocSpanLocked和freeSpanLocked完成。
 
-- alloc优先从已分配堆内存中进行分配，如果没有合适的堆内存块（mspan），则触发堆增长，并再次申请。
-- free将内存块归还到已分配堆内存队列中。一个额外动作是，通过检查当前mspan空间的和其连续空间的前后mspan是否均处于_MSpanFree状态，来决定是否要合并这些mspan。
+- allocSpanLocked优先从已分配堆内存中进行分配，如果没有合适的堆内存块（mspan），则触发堆增长，并再次申请。
+- freeSpanLocked将内存块归还到已分配堆内存队列中。一个额外动作是，通过检查当前mspan空间的和其连续空间的前后mspan是否均处于_MSpanFree状态，来决定是否要合并这些mspan。
 
 
 
@@ -853,8 +800,6 @@ HaveSpan:
 
 
 
-
-
 ### freeSpanLocked（释放）
 
 ```go
@@ -916,7 +861,50 @@ func (h *mheap) freeSpanLocked(s *mspan, acctinuse, acctidle bool, unusedsince i
 
 在busy列表中查找使用中的mspan，时间复杂度为常数级。
 
-## 小内存分配器
+
+
+## 基于缓存的分配器
+
+### sizeClass
+
+在内存管理中，大块内存比较容易管理，小块内存则是产生内存碎片的祸根。如果任由小块内存在系统中随机分配，最终可能会出现无法申请连续大块内存的情况。
+
+go中为了避免内存碎片，加速小内存的分配效率。对小内存进行了更细粒度的划分。
+
+go将小于等于32KB的内存，划分了67个级别，称之为sizeClass。每个级别对应的内存块大小保存在class_to_size数组中。以class_to_size[4]为例，其值为32，即如果我们为一个大小为18字节的对象分配空间时，实际runtime中，会对齐到class_to_size[4]的32字节来申请空间。
+
+这种对小内存的管理方式，为我们实现不同大小对象之间无干扰的分配提供了可能。代价则是会损失一部分的空间。在sizeclasses.go的注释中给出了各个sizeClass可能浪费的最大空间。
+
+至于为什么是67，这可能是相对准备32768个不同大小的分配器 和 过分离散的class导致的性能降低之间的一个折中。
+
+```go
+const (
+	_MaxSmallSize   = 32768
+	smallSizeDiv    = 8
+	smallSizeMax    = 1024
+	largeSizeDiv    = 128
+	_NumSizeClasses = 67
+)
+
+// 67种sizeclass对应的分配空间大小
+var class_to_size = [_NumSizeClasses]uint16{...}
+// 67种sizeclass对应的分配器应持有的系统页数量，被mcentral使用
+var class_to_allocnpages = [_NumSizeClasses]uint8{...}
+// 小于1024字节的任意空间大小对应的sizeclass
+var size_to_class8 = [smallSizeMax/smallSizeDiv + 1]uint8{...}
+// 大于1024、小于32768字节的任意空间大小对应的sizeclass
+var size_to_class128 = [(_MaxSmallSize-smallSizeMax)/largeSizeDiv + 1]uint8{...}
+```
+
+
+
+### spanClass
+
+spanClass是sizeClass的一种特殊表达，它将sizeClass的索引（即0-66）左移一位，低位用于表达noscan标记。如果最低位为1，表示不需要GC扫描该spanClass下的对象。
+
+go在编译期间，可以通过代码的AST分析可以得出内存分配的类型，以及类型中是否包含指针类型。这是对象是否需要被GC扫描的重要依据。当runtime进行内存分配时，可以通过将需要扫描的和不需要扫描的对象分开管理申请和释放。提升无指针类型申请和释放的效率。
+
+
 
 ### mcentral
 
