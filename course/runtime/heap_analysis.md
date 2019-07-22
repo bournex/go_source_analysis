@@ -89,7 +89,7 @@ arenahint指向最原始的虚拟内存空间，runtime.sysAlloc函数分配空�
 
 【图：arenaHints示意图】
 
-![arenaHints](https://github.com/bournex/go_source_analysis/images/goheap-arenahint.jpg)
+![arenaHints](https://raw.githubusercontent.com/bournex/go_source_analysis/master/images/goheap-arenahint.jpg)
 
 
 
@@ -144,7 +144,7 @@ type mheap struct {
 
 在mheap类中的arenas成员使用一个二维指针表达了整个虚拟内存空间。并提供了一些方法来操作这个空间。比如根据指针值，计算出其对应的heapArena对象。
 
-![](images/goheap-heapArena.jpg)
+![](https://raw.githubusercontent.com/bournex/go_source_analysis/master/images/goheap-heapArena.jpg)
 
 
 
