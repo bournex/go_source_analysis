@@ -819,7 +819,9 @@ HaveSpan:
 }
 ```
 
-在堆中的所有mspan对象，都是通过allocSpanLocked创建的。allocSpanLocked仅会返回满足需求页数量的内存空间，如果查找到堆中的mspan拥有的系统页数量超过需求量，多余的系统页将被额外新创建的mspan持有，并写回堆缓存中。
+allocSpanLocked仅会返回满足需求页数量的内存空间，如果查找到堆中的mspan拥有的系统页数量超过需求量，多余的系统页将被额外新创建的mspan持有，并写回堆缓存中。
+
+allocSpanLocked主要完成空闲mspan从free、freelarge的脱链，返回的mspan处于_MSpanFree状态。
 
 
 
@@ -866,7 +868,8 @@ func (h *mheap) freeSpanLocked(s *mspan, acctinuse, acctidle bool, unusedsince i
 		} else {
 			h.freeList(after.npages).remove(after)
 		}
-    // 释放before mspan对象，归还到spanalloc固定对象分配器中
+    // 释放before mspan对象，归还到spanalloc固定对象分配器中，固定对象分配器
+		// 要求传入的mspan状态必须为_MSpanDead
 		after.state = _MSpanDead
 		h.spanalloc.free(unsafe.Pointer(after))
 	}
@@ -886,21 +889,86 @@ func (h *mheap) freeSpanLocked(s *mspan, acctinuse, acctidle bool, unusedsince i
 
 
 
+### alloc/alloc_m
+
+alloc通过调用alloc_m方法实现mspan的分配，并对分配空间进行了必要的清零工作。
+
+实际内存分配的过程在alloc_m中
+
+```go
+// alloc
+func (h *mheap) alloc(npage uintptr, spanclass spanClass, large bool, needzero bool) *mspan
+
+// alloc_m
+func (h *mheap) alloc_m(npage uintptr, spanclass spanClass, large bool) *mspan {
+	//...
+	lock(&h.lock)
+	//...
+
+	s := h.allocSpanLocked(npage, &memstats.heap_inuse)
+	if s != nil {
+
+		//...
+		// 初始化mspan成员
+		s.state = _MSpanInUse
+		s.allocCount = 0
+		s.spanclass = spanclass
+		if sizeclass := spanclass.sizeclass(); sizeclass == 0 {
+			s.elemsize = s.npages << _PageShift
+			s.divShift = 0
+			s.divMul = 0
+			s.divShift2 = 0
+			s.baseMask = 0
+		} else {
+			s.elemsize = uintptr(class_to_size[sizeclass])
+			m := &class_to_divmagic[sizeclass]
+			s.divShift = m.shift
+			s.divMul = m.mul
+			s.divShift2 = m.shift2
+			s.baseMask = m.baseMask
+		}
+
+		// 记录大内存使用量，并将mspan添加到busy链表
+		h.pagesInUse += uint64(npage)
+		if large {
+			memstats.heap_objects++
+			mheap_.largealloc += uint64(s.elemsize)
+			mheap_.nlargealloc++
+			atomic.Xadd64(&memstats.heap_live, int64(npage<<_PageShift))
+			// 
+			if s.npages < uintptr(len(h.busy)) {
+				h.busy[s.npages].insertBack(s)
+			} else {
+				h.busylarge.insertBack(s)
+			}
+		}
+	}
+  
+	//...
+	unlock(&h.lock)
+	return s
+}
+```
+
+alloc_m调用allocSpanLocked分配了合适的mspan，完成了mspan的初始化，修改mspan状态为
+
+_MSpanInUse，并将mspan追加到mheap的busy链表中。
+
+
+
 ## 基于缓存的分配器
 
 在内存管理中，大块内存比较容易管理，小块内存则是产生内存碎片的祸根。如果任由小块内存在系统中随机分配，最终可能会出现无法申请连续大块内存的情况。
 
-go中为了避免内存碎片，加速小内存的分配效率。对小内存进行了更细粒度的划分。注意区分这里的小内存块与mheap中的小内存的区别。
+go中为了避免内存碎片，加速小内存的分配效率。对小内存进行了更细粒度的划分，基于缓存的分配器，主要解决的是小于32KB的对象分配问题。注意区分这里的小内存块与mheap中的小内存的区别。
 
-tiny：小于16字节的内存需求
 
-small：小于32KB的内存需求
 
 
 
 ### sizeClass
 
-go将小于等于32KB的内存，划分了67个级别，称之为sizeClass。每个级别对应的内存块大小保存在class_to_size数组中。以class_to_size[4]为例，其值为32，即如果我们为一个大小为18字节的对象分配空间时，实际runtime中，会对齐到class_to_size[4]的32字节来申请空间。
+go将小于等于32KB的内存，划分了67个级别，称之为sizeClass。每个级别对应的内存块大小保存在class_to_size数组中。以class_to_size[4]为例，其值为32，即如果我们为一个大小为22字节的对象分配空间时，实际runtime中，会对齐到class_to_size[4]的32字节来申请空间。
 
 这种对小内存的管理方式，为go实现不同大小对象之间无干扰的分配提供了可能。代价则是会损失一部分的空间。在sizeclasses.go的注释中给出了各个sizeClass可能浪费的最大空间。
 
@@ -971,6 +1039,61 @@ type mcentral struct {
 ```
 
 mcentral可以被理解为mcache的全局池，它分配空间以mspan为单位。nonempty链表中保存了还有可利用空间的mspans，empty中则保存了没有剩余可用空间或已经被mcache持有的mspans。这里吐槽一下这两个变量命名。
+
+首先来看下mcentral缓存的增长
+
+```go
+func (c *mcentral) grow() *mspan {
+	npages := uintptr(class_to_allocnpages[c.spanclass.sizeclass()])
+	size := uintptr(class_to_size[c.spanclass.sizeclass()])
+	n := (npages << _PageShift) / size
+
+	s := mheap_.alloc(npages, c.spanclass, false, true)
+	if s == nil {
+		return nil
+	}
+
+	p := s.base()
+	s.limit = p + size*n
+
+	heapBitsForAddr(s.base()).initSpan(s)
+	return s
+}
+
+func (c *mcentral) cacheSpan() *mspan
+func (c *mcentral) uncacheSpan(s *mspan)
+func (c *mcentral) freeSpan(s *mspan, preserve bool, wasempty bool) bool
+```
+
+grow方法获取了当前mcentral的spanClass对应需要申请的页数，以及在当前spanClass的size为单位，可以分配的对象数量n。调用mheap的alloc方法，申请一个mspan对象。并初始化mspan的结束位置limit。
+
+同时，提供了三个方法用来获取和释放mspan。
+
+
+
+#### cacheSpan
+
+首先遍历nonempty链表，如果发现存在剩余空间的mspan，则返回该mspan。
+
+如果nonempty链表为空，则遍历empty链表，先对链表成员mspan进行GC扫描，扫描过后如果有可用空间，则返回该mspan。
+
+如果两个链表都没有可用的mspan，则调用grow方法增长mcentral。
+
+通过cacheSpan获取的mspan被插入到empty链表尾部。仅有mcache对象会调用该方法。
+
+mspan.incache被设置为true。
+
+
+
+#### uncacheSpan
+
+如果s中还有剩余可分配空间，则将s插入到nonempty链表，否则依然在empty链表中保留。并将mspan.incache设置为false。
+
+
+
+freeSpan
+
+将s移到nonempty链表。如果s中已经没有被分配的对象了（s.allocCount == 0）。则将mspan归还给mheap。
 
 
 
