@@ -28,7 +28,7 @@ go的内存管理参考了tcmalloc，tcmalloc是google开源的一款内存管�
 
 # 系统级内存管理
 
-## 原始堆内存的初始化（mallocinit）
+## 原始堆内存的初始化
 
 操作系统提供的虚拟内存空间，是由寻找空间决定的，在amd64位系统上，有48个bit用于寻址，所以我们的可用地址空间，在1<<48个，这里没有占满64bit，因为48bit已经提供了256TB的虚拟地址寻址空间。这几乎已经足够大部分的系统应用了。
 
@@ -535,13 +535,21 @@ type mheap struct {
 
 ## summary
 
-malloc.go中实现了大部分从虚拟内存分配空间的方法。后面要说明的mheap相关内存操作，大部分是基于malloc中的方法来实现基本虚拟内存和基本堆内存的分配。
+以上是对go中系统虚拟内存的规划与分配介绍，这里共介绍了四类虚拟内存分配方法。
 
-malloc中管理内存的最小单位是arena，虽然局部涉及到了mspan类型，但大部分操作还是基于原始虚拟内存空间的操作。
+系统级内存分配 - 主要是通过mmap族系统方法实现虚拟内存的映射。
+
+小内存非堆分配 - 通过直接向操作系统映射内存的方式，获得非堆管理的内存空间。通过此方法分配的空间，大部分用于函数签名上带有//go:notinheap前缀，它们不会被GC关心。
+
+堆原始内存分配 - 原始堆内存的主要，也是唯一的分配方法。
+
+定长对象分配 - 用于分配非堆的定长对象。
+
+这些内存分配器，是go runtime的基本内存分配方法，它们主要对操作系统的内存操作api进行了封装，为后面的堆内存管理提供原始空间的内存分配方法。
 
 
 
-# mheap
+# 堆内存管理
 
 堆作为运行时的动态内存分配器，主要需要解决以下问题：
 
@@ -777,10 +785,10 @@ func (h *mheap) allocSpanLocked(npage uintptr, stat *uint64) *mspan {
 			goto HaveSpan
 		}
 	}
-	// 如果npage大于128，则从mheap.freelarge中分配满足npage数量的mspan
+	// 如果npage大于128，则从mheap.freelarge树堆中分配满足npage数量的mspan
 	s = h.allocLarge(npage)
 	if s == nil {
-		// mheap.freelarge中没有满足条件可用的mspan，则扩张堆空间。
+		// mheap.freelarge树堆中没有满足条件可用的mspan，则扩张堆空间。
 		if !h.grow(npage) {
 			return nil
 		}
@@ -905,6 +913,7 @@ func (h *mheap) alloc_m(npage uintptr, spanclass spanClass, large bool) *mspan {
 	lock(&h.lock)
 	//...
 
+	// 向堆中申请持有npage数量的mspan
 	s := h.allocSpanLocked(npage, &memstats.heap_inuse)
 	if s != nil {
 
@@ -956,13 +965,13 @@ _MSpanInUse，并将mspan追加到mheap的busy链表中。
 
 
 
-## 基于缓存的分配器
+## 基于缓存的小对象分配器
 
 在内存管理中，大块内存比较容易管理，小块内存则是产生内存碎片的祸根。如果任由小块内存在系统中随机分配，最终可能会出现无法申请连续大块内存的情况。
 
-go中为了避免内存碎片，加速小内存的分配效率。对小内存进行了更细粒度的划分，基于缓存的分配器，主要解决的是小于32KB的对象分配问题。注意区分这里的小内存块与mheap中的小内存的区别。
+go中为了避免内存碎片，加速小对象的分配效率。对小对象进行了更细粒度的划分，基于缓存的分配器，主要解决的是小于32KB的对象分配问题。
 
-
+注意区分这里的小对象与mheap中的小对象的区别，堆中的小对象是小于128个page的独立mspan，而基于缓存的分配器，关注的是一个mspan内的空间分配和释放。
 
 
 
@@ -1091,7 +1100,7 @@ mspan.incache被设置为true。
 
 
 
-freeSpan
+#### freeSpan
 
 将s移到nonempty链表。如果s中已经没有被分配的对象了（s.allocCount == 0）。则将mspan归还给mheap。
 
@@ -1121,15 +1130,258 @@ type mcache struct {
 
 
 
-# 应用级内存分配
+## 大对象内存分配器
+
+### largeAlloc
+
+```go
+func largeAlloc(size uintptr, needzero bool, noscan bool) *mspan {
+
+	if size+_PageSize < size {
+		throw("out of memory")
+	}
+	// 获得满足size大小的最小page数量
+	npages := size >> _PageShift
+	if size&_PageMask != 0 {
+		npages++
+	}
+  
+  //...
+  // 从堆中分配空间
+	s := mheap_.alloc(npages, makeSpanClass(0, noscan), true, needzero)
+	if s == nil {
+		throw("out of memory")
+	}
+  // 初始化mspan
+	s.limit = s.base() + size
+  // 实现对mspan的freeindex、allocCache、allocBits的初始化
+	heapBitsForAddr(s.base()).initSpan(s)
+	return s
+}
+```
+
+大对象通过largeAlloc分配，优先检查mheap的freelarge树堆中是否有可用空间。如果没有则向系统申请新的空间。见allocSpanLocked。
+
+
+
+# 应用级内存管理
+
+以上，go中的内存分配的核心方法已经基本阐述完了。对于用户代码，我们知道局部变量是通过栈指针的移动实现空间的申请和释放，而堆内存的申请，是通过new关键字实现的，释放则是由GC实现。这一部分主要描述用户在通过new关键字创建一个堆对象后，go runtime是如何给对象分配堆空间的。
 
 
 
 ### newobject
 
+```go
+func newobject(typ *_type) unsafe.Pointer {
+	return mallocgc(typ.size, typ, true)
+}
+```
+
+在代码的静态分析阶段，new关键字会被替换成newobject函数调用。该方法传入一个数据类型，内部仅调用了mallocgc方法。
+
+
+
 ### newarray
 
+```GO
+func newarray(typ *_type, n int) unsafe.Pointer {
+	if n == 1 {
+		return mallocgc(typ.size, typ, true)
+	}
+	if n < 0 || uintptr(n) > maxSliceCap(typ.size) {
+		panic(plainError("runtime: allocation size out of range"))
+	}
+	return mallocgc(typ.size*uintptr(n), typ, true)
+}
+```
+
+如果new创建的是一个数组类型，则编译器会将其替换为newarray方法调用。同样，newarray也指向了mallocgc。
+
+
+
 ### mallocgc
+
+```go
+func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	// ...
+
+	if size == 0 {
+		return unsafe.Pointer(&zerobase)
+	}
+
+	//...
+
+	// 获取m对象并锁住mallocking状态.
+	mp := acquirem()
+	if mp.mallocing != 0 {
+		throw("malloc deadlock")
+	}
+	if mp.gsignal == getg() {
+		throw("malloc during signal")
+	}
+	mp.mallocing = 1
+
+	shouldhelpgc := false
+	dataSize := size
+	// 获得m对象下的线程局部分配器mcache
+	c := gomcache()
+	var x unsafe.Pointer
+	// noscan作为spanClass的最低位，在这里获得，不需要被gc扫描的原因是当前类型中
+  // 没有指针(kindNoPointers)
+	noscan := typ == nil || typ.kind&kindNoPointers != 0
+	if size <= maxSmallSize /*size < 32KB*/ {
+		if noscan && size < maxTinySize /*size < 16bytes*/ {
+			// tiny 对象分配
+
+			off := c.tinyoffset
+			// 将tiny对象对齐到2的整数倍
+			if size&7 == 0 {
+				off = round(off, 8)
+			} else if size&3 == 0 {
+				off = round(off, 4)
+			} else if size&1 == 0 {
+				off = round(off, 2)
+			}
+      // 优先从mcache.tiny缓存中分配tiny对象空间。
+			if off+size <= maxTinySize && c.tiny != 0 {
+				x = unsafe.Pointer(c.tiny + off)
+				c.tinyoffset = off + size
+				c.local_tinyallocs++
+				mp.mallocing = 0
+				releasem(mp)
+				return x
+			}
+			// 从mcahce中新申请一个tiny缓存块，找到缓存块中可用的tiny空间地址v
+			span := c.alloc[tinySpanClass]
+			v := nextFreeFast(span)
+			if v == 0 {
+				v, _, shouldhelpgc = c.nextFree(tinySpanClass)
+			}
+			x = unsafe.Pointer(v)
+			(*[2]uint64)(x)[0] = 0
+			(*[2]uint64)(x)[1] = 0
+			// 将剩余的tiny缓存块覆盖到mcache.tiny中，便于下一次tiny对象的分配。
+			if size < c.tinyoffset || c.tiny == 0 {
+				c.tiny = uintptr(x)
+				c.tinyoffset = size
+			}
+			size = maxTinySize
+		} else /*size >= 16bytes && size <= 32KB*/ {
+      
+			// 获得目标大小对应的sizeClass索引和对齐到sizeClass的size值
+			var sizeclass uint8
+			if size <= smallSizeMax-8 {
+				sizeclass = size_to_class8[(size+smallSizeDiv-1)/smallSizeDiv]
+			} else {
+				sizeclass = size_to_class128[(size-smallSizeMax+largeSizeDiv-1)/largeSizeDiv]
+			}
+			size = uintptr(class_to_size[sizeclass])
+			// 构建spanClass，并从mcache对应spanClass的mspan中分配小对象空间
+			spc := makeSpanClass(sizeclass, noscan)
+			span := c.alloc[spc]
+			v := nextFreeFast(span)
+			if v == 0 {
+				v, span, shouldhelpgc = c.nextFree(spc)
+			}
+			x = unsafe.Pointer(v)
+			if needzero && span.needzero != 0 {
+        // 清零小对象空间
+				memclrNoHeapPointers(unsafe.Pointer(v), size)
+			}
+		}
+	} else /*size > 32KB*/ {
+		// 在系统栈上调用largeAlloc分配堆空间，将分配获得的mspan首地址作为大对象返回
+		// 地址，相应的移动空闲块索引freeindex、allocCount
+		var s *mspan
+		shouldhelpgc = true
+		systemstack(func() {
+			s = largeAlloc(size, needzero, noscan)
+		})
+		s.freeindex = 1
+		s.allocCount = 1
+		x = unsafe.Pointer(s.base())
+		size = s.elemsize
+	}
+
+	var scanSize uintptr
+	if !noscan {
+		// If allocating a defer+arg block, now that we've picked a malloc size
+		// large enough to hold everything, cut the "asked for" size down to
+		// just the defer header, so that the GC bitmap will record the arg block
+		// as containing nothing at all (as if it were unused space at the end of
+		// a malloc block caused by size rounding).
+		// The defer arg areas are scanned as part of scanstack.
+		if typ == deferType {
+			dataSize = unsafe.Sizeof(_defer{})
+		}
+		heapBitsSetType(uintptr(x), size, dataSize, typ)
+		if dataSize > typ.size {
+			// Array allocation. If there are any
+			// pointers, GC has to scan to the last
+			// element.
+			if typ.ptrdata != 0 {
+				scanSize = dataSize - typ.size + typ.ptrdata
+			}
+		} else {
+			scanSize = typ.ptrdata
+		}
+		c.local_scan += scanSize
+	}
+
+	// Ensure that the stores above that initialize x to
+	// type-safe memory and set the heap bits occur before
+	// the caller can make x observable to the garbage
+	// collector. Otherwise, on weakly ordered machines,
+	// the garbage collector could follow a pointer to x,
+	// but see uninitialized memory or stale heap bits.
+	publicationBarrier()
+
+	// Allocate black during GC.
+	// All slots hold nil so no scanning is needed.
+	// This may be racing with GC so do it atomically if there can be
+	// a race marking the bit.
+	if gcphase != _GCoff {
+		gcmarknewobject(uintptr(x), size, scanSize)
+	}
+
+	if raceenabled {
+		racemalloc(x, size)
+	}
+
+	if msanenabled {
+		msanmalloc(x, size)
+	}
+  
+	// 解锁并释放m对象
+	mp.mallocing = 0
+	releasem(mp)
+
+	if debug.allocfreetrace != 0 {
+		tracealloc(x, size, typ)
+	}
+
+	if rate := MemProfileRate; rate > 0 {
+		if size < uintptr(rate) && int32(size) < c.next_sample {
+			c.next_sample -= int32(size)
+		} else {
+			mp := acquirem()
+			profilealloc(mp, x, size)
+			releasem(mp)
+		}
+	}
+
+	//...
+
+	return x
+}
+```
+
+在mallocgc中，可以清洗的看到，内存分配过程对tiny、small、large对象做了不同的处理。
+
+
+
+## summary
 
 
 
@@ -1139,9 +1391,13 @@ type mcache struct {
 
 调用链分析
 
+性能分析
+
 ## 小对象内存分配
 
 调用链分析
+
+性能分析
 
 
 
