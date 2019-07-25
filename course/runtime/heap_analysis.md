@@ -841,7 +841,7 @@ HaveSpan:
 		h.setSpan(t.base(), t)
 		h.setSpan(t.base()+t.npages*pageSize-1, t)
 		t.needzero = s.needzero
-		s.state = _MSpanManual	// s是最终要返回的mspan对象，由于其余t是连续的，为了避免free t时发生合并，暂时将s状态置为非_MSpanFree
+		s.state = _MSpanManual	// s是最终要返回的mspan对象，由于其与t是连续的，为了避免free t时发生合并，暂时将s状态置为非_MSpanFree
 		t.state = _MSpanManual
 		h.freeSpanLocked(t, false, false, s.unusedsince)
 		s.state = _MSpanFree
@@ -1141,6 +1141,10 @@ mspan.incache被设置为true。
 
 ### mcache
 
+mcache是无锁的分配器，是被m、p对象所持有的，用于加速goroutine局部小对象分配效率的局部分配器，每个p对象持有一个独立的mcache对象，当m需要被运行时，从p获得mcache指针，用于内存分配。由于一个m表达了一个系统级线程，所以mcache也可以看成是线程局部安全的。
+
+
+
 ```go
 type mcache struct {
 	next_sample int32   	// GC相关，先不看；trigger heap sample after allocating this many bytes
@@ -1148,13 +1152,15 @@ type mcache struct {
 	
   tiny             uintptr	// 当前tiny块的起始地址
   tinyoffset       uintptr	// 当前tiny块已经分配到的位置
-  local_tinyallocs uintptr // 当前已经分配的tiny块数量；number of tiny allocs not counted in other stats
-  // The rest is not accessed on every malloc.
-  alloc [numSpanClasses]*mspan 			//  spans to allocate from, indexed by spanClass
+  local_tinyallocs uintptr // 当前已经分配的tiny块数量
+  
+  // 所有spanClass下的mspan对象，对每种spanClass保留有一个mspan用于分配。
+  alloc [numSpanClasses]*mspan
 
+	// 空闲栈缓存，我们会在栈一节再进行讨论
   stackcache [_NumStackOrders]stackfreelist
 
-  // Local allocator stats, flushed during GC.
+  // 内存统计相关，在GC时被flush
   local_largefree  uintptr                  // bytes freed for large objects (>maxsmallsize)
   local_nlargefree uintptr                  // number of frees for large objects (>maxsmallsize)
   local_nsmallfree [_NumSizeClasses]uintptr // number of frees for small objects (<=maxsmallsize)
@@ -1180,14 +1186,16 @@ func largeAlloc(size uintptr, needzero bool, noscan bool) *mspan {
 	}
   
   //...
-  // 从堆中分配空间
+  // 从堆中分配空间。关键的一点是makeSpanClass传入了0。这决定了向堆分配的是整块
+	// 的内存，而不是以spanClass划分的小内存mspan。mspan的elemsize变量会被赋值
+	// 为pages<<_PageSize。
 	s := mheap_.alloc(npages, makeSpanClass(0, noscan), true, needzero)
 	if s == nil {
 		throw("out of memory")
 	}
   // 初始化mspan
 	s.limit = s.base() + size
-  // 实现对mspan的freeindex、allocCache、allocBits的初始化
+  // 对mspan的freeindex、allocCache、allocBits的初始化
 	heapBitsForAddr(s.base()).initSpan(s)
 	return s
 }
@@ -1197,11 +1205,51 @@ func largeAlloc(size uintptr, needzero bool, noscan bool) *mspan {
 
 
 
-## 非GC内存分配与释放
+## 手动管理内存分配与释放
 
-allocManual
+手动管理的内存是指申请后mspan状态为_MSpanManual的内存，主要使用在goroutine栈内存的申请。手动管理是说它提供了一对儿allocManual/freeManual的方法，也就是说，与之前描述的分配器不同，其他分配器归还内存给堆是通过GC实现，而手动管理的内存，需要在代码中显式调用freeManual归还到堆。
 
-freeManual
+
+
+### allocManual
+
+```go
+func (h *mheap) allocManual(npage uintptr, stat *uint64) *mspan {
+	lock(&h.lock)
+	s := h.allocSpanLocked(npage, stat)
+	if s != nil {
+		s.state = _MSpanManual
+		s.manualFreeList = 0
+		s.allocCount = 0
+		s.spanclass = 0
+		s.nelems = 0
+		s.elemsize = 0
+		s.limit = s.base() + s.npages<<_PageShift
+		//...
+	}
+
+	unlock(&h.lock)
+
+	return s
+}
+```
+
+
+
+### freeManual
+
+```go
+func (h *mheap) freeManual(s *mspan, stat *uint64) {
+	s.needzero = 1
+	lock(&h.lock)
+	*stat -= uint64(s.npages << _PageShift)
+	memstats.heap_sys += uint64(s.npages << _PageShift)
+	h.freeSpanLocked(s, false, true, 0)
+	unlock(&h.lock)
+}
+```
+
+
 
 
 
@@ -1418,7 +1466,7 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 }
 ```
 
-在mallocgc中，可以清洗的看到，内存分配过程对tiny、small、large对象做了不同的处理。
+在mallocgc中可以看到，内存分配过程对tiny、small、large对象做了不同的处理。
 
 
 
