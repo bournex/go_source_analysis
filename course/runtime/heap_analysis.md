@@ -148,7 +148,7 @@ type mheap struct {
 
 
 
-### heapArena索引计算
+#### heapArena索引计算
 
 arenas中，arenaL1Bits、arenaL2Bits分别表达了第一维和第二维的bit shift，在64位系统上，arenaL1Bits为0，arenaL2Bits为22。所以最多会有4MB个heapArena对象。由于每个heapArena对象都表达了64MB的虚拟内存空间，所以4MB * 64MB = 1 << 48，arenas就覆盖了整个虚拟内存空间。
 
@@ -193,7 +193,36 @@ amd在设计64位系统的虚拟内存空间时，对地址定义做了如下限
 
 
 
-### 如何判定内存是否在堆上
+#### 关联mspan与heapArena
+
+关联主要通过setSpan/setSpans方法实现。实现方式也很简单，对于传入的地址计算其arenaIndex，找出该地址所属的heapArena对象，将通过除以系统页大小获得在整个虚拟空间上页的索引，将mspan指针设置到span成员的指定slot上。
+
+```go
+func (h *mheap) setSpan(base uintptr, s *mspan) {
+	ai := arenaIndex(base)
+	h.arenas[ai.l1()][ai.l2()].spans[(base/pageSize)%pagesPerArena] = s
+}
+
+func (h *mheap) setSpans(base, npage uintptr, s *mspan) {
+	p := base / pageSize
+	ai := arenaIndex(base)
+	ha := h.arenas[ai.l1()][ai.l2()]
+	for n := uintptr(0); n < npage; n++ {
+		i := (p + n) % pagesPerArena
+		if i == 0 {
+			ai = arenaIndex(base + n*pageSize)
+			ha = h.arenas[ai.l1()][ai.l2()]
+		}
+		ha.spans[i] = s
+	}
+}
+```
+
+setSpan和setSpans建立起了heapArena到mspan的映射关系，这为后面实现通过任意指针地址查找对应的mspan提供了支持。
+
+
+
+#### 如何判定内存是否在堆上
 
 go堆中的内存，所有已分配的空间是由称作mspan类型的对象来持有并管理的，在原始虚拟内存中，mallocinit初始化时限定了堆内存的绝对分配范围，mheap通过heapArena对所有的堆内存进行了划分，而heapArena中的spans成员又保存了64MB的空间下每个物理页归属的mspan对象。所以只要是有效的堆内存地址，都可以唯一地映射到一个heapArena对象上。也可以直接映射到一个mspan对象上。
 
@@ -812,7 +841,7 @@ HaveSpan:
 		h.setSpan(t.base(), t)
 		h.setSpan(t.base()+t.npages*pageSize-1, t)
 		t.needzero = s.needzero
-		s.state = _MSpanManual // prevent coalescing with s
+		s.state = _MSpanManual	// s是最终要返回的mspan对象，由于其余t是连续的，为了避免free t时发生合并，暂时将s状态置为非_MSpanFree
 		t.state = _MSpanManual
 		h.freeSpanLocked(t, false, false, s.unusedsince)
 		s.state = _MSpanFree
@@ -962,6 +991,10 @@ func (h *mheap) alloc_m(npage uintptr, spanclass spanClass, large bool) *mspan {
 alloc_m调用allocSpanLocked分配了合适的mspan，完成了mspan的初始化，修改mspan状态为
 
 _MSpanInUse，并将mspan追加到mheap的busy链表中。
+
+
+
+此外，由于allocSpanLocked/freeSpanLocked是对堆缓存的主要操作方法，所以在调用这两个方法的位置需要加锁，使用的是mheap.lock对象。
 
 
 
@@ -1161,6 +1194,14 @@ func largeAlloc(size uintptr, needzero bool, noscan bool) *mspan {
 ```
 
 大对象通过largeAlloc分配，优先检查mheap的freelarge树堆中是否有可用空间。如果没有则向系统申请新的空间。见allocSpanLocked。
+
+
+
+## 非GC内存分配与释放
+
+allocManual
+
+freeManual
 
 
 
