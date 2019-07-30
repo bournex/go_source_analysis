@@ -25,3 +25,18 @@ allglock - 用于锁allgs
 g、m、p状态转移图
 
 gmp关系图
+
+
+
+大纲
+
+gmp结构
+
+gmp在运行时的组织
+
+gmp的创建与销毁
+
+调度概念，gmp状态
+
+go调度
+

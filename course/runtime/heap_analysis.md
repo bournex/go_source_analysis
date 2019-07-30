@@ -1251,6 +1251,8 @@ func (h *mheap) freeManual(s *mspan, stat *uint64) {
 
 
 
+## mspan的状态变迁
+
 
 
 # 应用级内存管理
@@ -1487,6 +1489,18 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 调用链分析
 
 性能分析
+
+
+
+# 堆内存的回收
+
+## scavenge
+
+## scavengelist
+
+## scavengetreap
+
+回收时机
 
 
 
