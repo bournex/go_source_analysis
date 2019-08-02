@@ -55,21 +55,24 @@ SP: Stack pointer: top of stack.
 
 
 
-+——————————— FP（高地址）
 
-|   return address
 
-+——————————— 
+—————+——————————— FP（高地址）
 
-|   parent caller BP
+​			|   return address
 
-+———————————  <- BP，SP
+​			+——————————— 
 
-|   local variables
+callee |   parent caller BP
 
-+——————————— 
+​			+———————————  <- BP，Pseudo SP
 
-|   callee needed args
+​			|   local variables
 
-+——————————— <- Physical SP（system register，increace automatically）（低地址）
+—————+———————————  <- Physical SP（system register，increace automatically）（低地址）
 
+
+
+
+
+go可变参数函数实现原理
