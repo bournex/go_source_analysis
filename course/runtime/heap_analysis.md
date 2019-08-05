@@ -1492,7 +1492,9 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 
 调用链分析
 
-性能分析
+![](https://raw.githubusercontent.com/bournex/go_source_analysis/master/images/goheap-largealloc.jpg)
+
+在mallocgc中，被判定为大内存需求的请求，将调用largeAlloc来分配空间，并在alloc/alloc_m中对mheap加锁并切换至系统栈空间。优先查看mheap的mtreap中是否存在满足需求的空闲大内存块，如果存在则直接返回，否则向系统申请。
 
 
 
@@ -1500,7 +1502,11 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 
 调用链分析
 
-性能分析
+![](https://raw.githubusercontent.com/bournex/go_source_analysis/master/images/goheap-tinysmallalloc.jpg)
+
+在mallocgc中被判定为tiny或small需求的请求，将优先使用当前m对象中的mcache来分配。mcache中维护着所有sizeclass类型的mspan对象。如果满足了需求则直接分配并返回。否则要向中央分配器mcentral申请cache新的mspan对象。在这之前的分配过程都是没有锁的（图中绿色部分）。
+
+注意从这里再往后的调用，将切换到系统栈完成。如果mcentral没有空闲mspan，则查看堆缓存，如果堆缓存没有满足需求的mspan，则向系统申请。最后逐级返回，新申请的mspan将被设置到当前m的mcache对象内。
 
 
 
@@ -1556,7 +1562,7 @@ func fastrand() uint32 {
 }
 ```
 
-## GC初探
+
 
 # 引用
 
