@@ -1261,6 +1261,8 @@ func (h *mheap) freeManual(s *mspan, stat *uint64) {
 
 ## mspan的状态变迁
 
+![](https://raw.githubusercontent.com/bournex/go_source_analysis/master/images/goheap-spanstatus.jpg)
+
 
 
 # 应用级内存管理
@@ -1491,6 +1493,8 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 调用链分析
 
 性能分析
+
+
 
 ## 小对象内存分配
 
