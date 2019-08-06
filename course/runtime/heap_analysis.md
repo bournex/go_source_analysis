@@ -203,6 +203,7 @@ func (h *mheap) setSpan(base uintptr, s *mspan) {
 	h.arenas[ai.l1()][ai.l2()].spans[(base/pageSize)%pagesPerArena] = s
 }
 
+// 堆npage数量的pages的所有者在heapArean.spans上标记为s
 func (h *mheap) setSpans(base, npage uintptr, s *mspan) {
 	p := base / pageSize
 	ai := arenaIndex(base)
@@ -259,7 +260,7 @@ func spanOfHeap(p uintptr) *mspan
 
 如果一段arena虚拟内存地址没有在go中被分配过，则其地址对应的heapArena指针为空。
 
-
+#### TODO：arenas的应用
 
 ## 内存分配核心方法
 
