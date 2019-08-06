@@ -40,6 +40,8 @@ runtime/mfixalloc.go
 
 runtime/mbitmap.go
 
+
+
 ## 常用全局变量
 
 为避免出现理解上的偏差，本文默认讨论的场景主要为amd64架构下的64位linux系统环境。
@@ -96,9 +98,9 @@ const(
 
 go在mallocinit中初始化了128个arenahint对象，从0xC000000000开始循环128次，令每个arenahint.addr指向1TB空间的起始地址。作为堆内存的寻址指引。所有在应用程序中通过new关键字创建的对象地址，最终都指向大于0xC000000000的地址。
 
-虽然指定的arenahint链表有128TB空间之大，但堆内存的地址不止如此，后面可以看到当128TB空间耗尽后，arenahint链表还会继续扩张。
+虽然arenahint链表表达了有128TB空间之大，但堆内存的地址不止如此，当128TB空间耗尽后，arenahint链表还会继续扩张。
 
-选择将堆地址放在0xC000000000的位置，注释阐明了原因。一方面方便调试时识别堆内存空间。另一方面，在用大端法表达地址时，C0不是有效的UTF-8字符，可以一定程度上规避对指针类型被错误解释成UTF8字符。
+选择将堆地址放在0xC000000000的位置，注释阐明了原因。一方面方便调试时识别堆内存空间。另一方面，在用大端法表达地址时，C0不是有效的UTF-8字符，可以一定程度上规避指针类型被错误解释成UTF8字符。
 
 我们且称这部分128TB的内存为堆原始内存。
 
@@ -246,12 +248,12 @@ func (i arenaIdx) l2() uint {
 
 前面我们提到过，系统上寻址空间为48位。而指针变量为64位。
 
-amd在设计64位系统的虚拟内存空间时，对地址定义做了如下限制：即要求指针值的48-63位，必须要与第47位一致，否则访存时会触发异常。（扩展：[虚拟内存地址空间](https://zh.wikipedia.org/wiki/X86-64)）
+amd在设计64位系统的虚拟内存空间时，对地址定义做了如下限制：即要求指针值的48-63位，必须要与第47位一致，否则访存时会触发异常。
 
-根据这一规则，go中将index的计算进行了特殊处理，即向地址追加一个0x800000000000的arena基址再计算index，这会产生如下效果：
+根据这一规则，go中将index的计算进行了特殊处理，即向地址追加一个0x8000 0000 0000的arena基址再计算index，这会产生如下效果：
 
-- 对于小于等于0x7FFFFFFFFFFF的地址，追加arena基址后，获得的arenaIndex位于arenas二维数组的后半部分。
-- 对于大于0x7FFFFFFFFFFF的地址，追加arena基址后，触发了地址值的溢出，因此获得的arenaIndex位于arenas二位数组的前半部分。
+- 对于小于等于0x7FFF FFFF FFFF的地址，追加arena基址后，获得的arenaIndex位于arenas二维数组的后半部分。
+- 对于大于0x7FFF FFFF FFFF的地址，追加arena基址后，触发了地址值的溢出，因此获得的arenaIndex位于arenas二位数组的前半部分。
 
 
 
@@ -733,7 +735,7 @@ type mspan struct {
 }
 ```
 
-堆中无论是空闲还是使用中的内存，都可以用mspan对象来表达。mspan中持有系统页整数倍的内存空间。通过一个状态标记来标识当前mspan是被使用中还是空闲中。
+堆中无论是空闲还是使用中的内存，都使用mspan对象来表达。mspan中持有系统页整数倍的内存空间。通过state状态标记来标识当前mspan是被使用中还是空闲中。
 
 mspan中持有的空间，可用来分配一个或多个相同类型的对象空间，elemsize表明了对象类型占用的空间大小。nelems表明了当前mspan下可以分配对象的最大数量。
 
@@ -741,7 +743,7 @@ mspan中持有的空间，可用来分配一个或多个相同类型的对象空
 
 mspan在mheap、mcentral、mcache中都有缓存。
 
-区别在于，在mheap中缓存的mspan对象是以page为单位的，npages表明了mheap中的mspan对象所持有的系统页数量。
+区别在于，在mheap中缓存的mspan对象是以page为单位的，npages表明了mheap中的mspan对象所持有的系统页数量。mheap分配空间时，根据需求的page数量，分配合适的mspan给使用者。mheap不会分配半个mspan给使用者。
 
 而在mcentral、mcache中的mspan，是以spanclass来划分的，spanclass可以理解为一个限定的对象大小。一个mspan被分配到mcentral或mcache后，它的spanclass是固定的，意味着在这个mspan上，只能分配大小固定的对象。详见spanclass。
 
@@ -758,7 +760,31 @@ type mSpanList struct {
 }
 ```
 
+
+
 ### mspan空闲块
+
+mspan在mcache或mcentral中被用于小内存分配时，需要将以page为单位从mheap获取的空间按照sizeclass划分。比如包含1个page大小8KB的mspan，当被用作16字节对象分配时，它最多可以分配8192/16=512个对象。mspan的空闲块管理的主要工作就是管理这些对象空间。
+
+
+
+空闲块的管理主要通过mspan中的allocBits、allocCache、freeindex和nelems成员实现。
+
+allocBits的类型为gcBits，实际就是byte指针类型。
+
+在mspan被初始化时，通过指定的sizeclass/spanclass，可以计算出其最多可申请的对象数量，还以上面的例子为例：
+
+将mspan的8KB空间视为512个slot。
+
+freeindex在mspan初始化时被置为0。
+
+allocBits作为mspan空间的位图，使用512个bit位（64bytes）表达512个slot的分配状态。如果slot已被分配，则对应位为1，否则为0。
+
+allocCache作为allocBits的滑动窗口，表示当前窗口下的64个slot，配合freeindex和德布鲁因算法，快速查找当前窗口下的空闲slot。不同于allocBits，在allocCache中bit位为1的表示未分配，0表示已分配。
+
+nelems == 512，表示可分配对象的最大数量。
+
+
 
 ### mspan空闲块的查找
 
@@ -1059,9 +1085,7 @@ func (h *mheap) alloc_m(npage uintptr, spanclass spanClass, large bool) *mspan {
 }
 ```
 
-alloc_m调用allocSpanLocked分配了合适的mspan，完成了mspan的初始化，修改mspan状态为
-
-_MSpanInUse，并将mspan追加到mheap的busy链表中。
+alloc_m调用allocSpanLocked分配了合适的mspan，完成了mspan的初始化，修改mspan状态为_MSpanInUse，并将mspan追加到mheap的busy链表中。
 
 
 
@@ -1276,7 +1300,7 @@ func largeAlloc(size uintptr, needzero bool, noscan bool) *mspan {
 
 
 
-## 手动管理内存分配与释放
+## 手动管理内存的分配与释放
 
 手动管理的内存是指申请后mspan状态为_MSpanManual的内存，主要使用在goroutine栈内存的申请。手动管理是说它提供了一对儿allocManual/freeManual的方法，也就是说，与之前描述的分配器不同，其他分配器归还内存给堆是通过GC实现，而手动管理的内存，需要在代码中显式调用freeManual归还到堆。
 
@@ -1468,72 +1492,11 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 		size = s.elemsize
 	}
 
-	var scanSize uintptr
-	if !noscan {
-		// If allocating a defer+arg block, now that we've picked a malloc size
-		// large enough to hold everything, cut the "asked for" size down to
-		// just the defer header, so that the GC bitmap will record the arg block
-		// as containing nothing at all (as if it were unused space at the end of
-		// a malloc block caused by size rounding).
-		// The defer arg areas are scanned as part of scanstack.
-		if typ == deferType {
-			dataSize = unsafe.Sizeof(_defer{})
-		}
-		heapBitsSetType(uintptr(x), size, dataSize, typ)
-		if dataSize > typ.size {
-			// Array allocation. If there are any
-			// pointers, GC has to scan to the last
-			// element.
-			if typ.ptrdata != 0 {
-				scanSize = dataSize - typ.size + typ.ptrdata
-			}
-		} else {
-			scanSize = typ.ptrdata
-		}
-		c.local_scan += scanSize
-	}
-
-	// Ensure that the stores above that initialize x to
-	// type-safe memory and set the heap bits occur before
-	// the caller can make x observable to the garbage
-	// collector. Otherwise, on weakly ordered machines,
-	// the garbage collector could follow a pointer to x,
-	// but see uninitialized memory or stale heap bits.
-	publicationBarrier()
-
-	// Allocate black during GC.
-	// All slots hold nil so no scanning is needed.
-	// This may be racing with GC so do it atomically if there can be
-	// a race marking the bit.
-	if gcphase != _GCoff {
-		gcmarknewobject(uintptr(x), size, scanSize)
-	}
-
-	if raceenabled {
-		racemalloc(x, size)
-	}
-
-	if msanenabled {
-		msanmalloc(x, size)
-	}
+	// ...
   
 	// 解锁并释放m对象
 	mp.mallocing = 0
 	releasem(mp)
-
-	if debug.allocfreetrace != 0 {
-		tracealloc(x, size, typ)
-	}
-
-	if rate := MemProfileRate; rate > 0 {
-		if size < uintptr(rate) && int32(size) < c.next_sample {
-			c.next_sample -= int32(size)
-		} else {
-			mp := acquirem()
-			profilealloc(mp, x, size)
-			releasem(mp)
-		}
-	}
 
 	//...
 
@@ -1596,7 +1559,7 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 const deBruijn64 = 0x0218a392cd3d5dbf	//0000001000011000101000111001001011001101001111010101110110111111
 func Ctz64(x uint64) int {
 	x &= -x                      // isolate low-order bit
-	y := x * deBruijn64 >> 58    // extract part of deBruijn sequence
+  y := (x * deBruijn64) >> 58    // extract part of deBruijn sequence
 	i := int(deBruijnIdx64[y])   // convert to bit index
 	z := int((x - 1) >> 57 & 64) // adjustment if zero
 	return i + z
@@ -1630,3 +1593,5 @@ func fastrand() uint32 {
 [google tcmalloc](http://goog-perftools.sourceforge.net/doc/tcmalloc.html)
 
 [德布鲁因算法](http://supertech.csail.mit.edu/papers/debruijn.pdf)
+
+[虚拟内存地址空间](https://zh.wikipedia.org/wiki/X86-64)
