@@ -8,21 +8,83 @@
 
 # overview
 
-go的内存管理参考了tcmalloc，tcmalloc是google开源的一款内存管理工具，它比glibc中自带的ptmalloc性能要更高。
+go的内存管理参考了tcmalloc，tcmalloc是google开源的一款内存管理工具。对比glibc中的ptmalloc2，tcmalloc对SMP架构更加友好。增加了线程局部的分配器，对小内存的分配进行了优化。
 
-在tcmalloc中，对内存进行划分，大小内存需求进行了不同的处理。对于小内存，按照需求量的不同，实际申请空间被对齐到了预先规划好的大小。同时为小内存的申请，增加了线程局部分配器，用于快速无锁分配。
-
-而对于大内存需求，则不提供线程局部分配器。所有请求都统一通过heap来管理。
+go中在tcmalloc的基础上
 
 
-
-## ptmalloc  vs  tcmalloc  vs  jemalloc
 
 
 
 # 预备知识
 
+## 代码范围
+
+本文讨论的代码范围如下：
+
+runtime/malloc.go
+
+runtime/mheap.go
+
+runtime/mmap.go
+
+runtime/mcache.go
+
+runtime/mcentral.go
+
+runtime/sizeclasses.go
+
+runtime/mgclarge.go
+
+runtime/mfixalloc.go
+
+runtime/mbitmap.go
+
 ## 常用全局变量
+
+为避免出现理解上的偏差，本文默认讨论的场景主要为amd64架构下的64位linux系统环境。
+
+```go
+const(
+	// go中定义的内存页大小为8KB
+	_PageShift = 13
+	_PageSize = 1 << _PageShift
+	_PageMask = _PageSize - 1
+  
+	// 固定长度分配器单次申请空间大小为16KB
+	_FixAllocChunk = 16 << 10
+  
+	// tiny内存块大小
+	_TinySize      = 16
+  
+	// go中堆的最大寻址范围。64位系统中为48（bit）
+	heapAddrBits = (_64bit*(1-sys.GoarchWasm))*48 + (1-_64bit+sys.GoarchWasm)*(32-(sys.GoarchMips+sys.GoarchMipsle))
+  
+	// 最大可用用户虚拟内存空间大小，即1<<48=256TB，实际达不到这么大。
+	maxAlloc = (1 << heapAddrBits) - (1-_64bit)*1
+
+  // heap arena大小的对数值，64位系统为26
+	logHeapArenaBytes = (6+20)*(_64bit*(1-sys.GoosWindows)) + (2+20)*(_64bit*sys.GoosWindows) + (2+20)*(1-_64bit)
+  
+	// heap arena大小
+	heapArenaBytes = 1 << logHeapArenaBytes
+  
+	// heap arena的bitmap数组大小
+	heapArenaBitmapBytes = heapArenaBytes / (sys.PtrSize * 8 / 2)
+  
+	// 一个heapArena包含的虚拟内存页数量
+	pagesPerArena = heapArenaBytes / pageSize
+  
+	// heapArena指针二维数组中第一维的大小，64位系统为0，所以二维数组退化为一维
+	arenaL1Bits = 6 * (_64bit * sys.GoosWindows)
+  
+	// heapArena指针二维数组中的第二维大小，64位系统中为26
+	arenaL2Bits = heapAddrBits - logHeapArenaBytes - arenaL1Bits
+  
+	// 系统物理内存页最小值4KB
+	minPhysPageSize = 4096
+)
+```
 
 
 
@@ -1489,27 +1551,26 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 
 # 内存分配流程
 
-## 大对象内存分配
-
-调用链分析
-
-![](https://raw.githubusercontent.com/bournex/go_source_analysis/master/images/goheap-largealloc.jpg)
-
-在mallocgc中，被判定为大内存需求的请求，将调用largeAlloc来分配空间，并在alloc/alloc_m中对mheap加锁并切换至系统栈空间。优先查看mheap的mtreap中是否存在满足需求的空闲大内存块，如果存在则直接返回，否则向系统申请。
-
-
-
 ## 小对象内存分配
 
 调用链分析
 
 ![](https://raw.githubusercontent.com/bournex/go_source_analysis/master/images/goheap-tinysmallalloc.jpg)
 
-在mallocgc中被判定为tiny或small需求的请求，将优先使用当前m对象中的mcache来分配。mcache中维护着所有sizeclass类型的mspan对象。如果满足了需求则直接分配并返回。否则要向中央分配器mcentral申请cache新的mspan对象。在这之前的分配过程都是没有锁的（图中绿色部分）。
+1. 将申请的小内存需求大小对齐到最小满足需求的sizeclass，查看当前m对象下的mcache中是否有满足需求的mspan，如果mspan有空闲空间，则直接分配空间。整个过程无需加锁。
+2. 从mcentral获取一个满足需求sizeclass的mspan。
+3. 如果mcentral对应sizeclass的mspan列表为空，则向堆（缓存）以page为单位申请空间，用于构建新的mspan。
+4. 如果堆（缓存）中没有可用的mspan，则向操作系统申请空间，在64位系统上，一次会申请一个Arena，即64MB。
 
-注意从这里再往后的调用，将切换到系统栈完成。如果mcentral没有空闲mspan，则查看堆缓存，如果堆缓存没有满足需求的mspan，则向系统申请。最后逐级返回，新申请的mspan将被设置到当前m的mcache对象内。
 
 
+## 大对象内存分配
+
+![](https://raw.githubusercontent.com/bournex/go_source_analysis/master/images/goheap-largealloc.jpg)
+
+
+
+大对象内存申请绕过了mcache和mcentral，直接向堆（缓存）申请空间。而后同小内存分配的过程4。
 
 # 堆内存的回收
 
@@ -1542,9 +1603,6 @@ func Ctz64(x uint64) int {
 }
 ```
 
-https://en.wikipedia.org/wiki/De_Bruijn_sequence
-http://supertech.csail.mit.edu/papers/debruijn.pdf
-
 ## fastrand
 
 ```go
@@ -1567,4 +1625,8 @@ func fastrand() uint32 {
 
 # 引用
 
-[https://github.com/qyuhen/book/blob/master/Go%201.5%20%E6%BA%90%E7%A0%81%E5%89%96%E6%9E%90.pdf](https://github.com/qyuhen/book/blob/master/Go 1.5 源码剖析.pdf)
+[雨痕go1.5源码分析](https://github.com/qyuhen/book/blob/master/Go 1.5 源码剖析.pdf)
+
+[google tcmalloc](http://goog-perftools.sourceforge.net/doc/tcmalloc.html)
+
+[德布鲁因算法](http://supertech.csail.mit.edu/papers/debruijn.pdf)
