@@ -6,14 +6,6 @@
 
 内存管理的常见方式
 
-# overview
-
-go的内存管理参考了tcmalloc，tcmalloc是google开源的一款内存管理工具。对比glibc中的ptmalloc2，tcmalloc对SMP架构更加友好。增加了线程局部的分配器，对小内存的分配进行了优化。
-
-go中在tcmalloc的基础上
-
-
-
 
 
 # 预备知识
@@ -39,6 +31,8 @@ runtime/mgclarge.go
 runtime/mfixalloc.go
 
 runtime/mbitmap.go
+
+约4K行代码
 
 
 
@@ -87,6 +81,12 @@ const(
 	minPhysPageSize = 4096
 )
 ```
+
+
+
+## 设计思想
+
+go的内存管理参考了tcmalloc，tcmalloc是google开源的一款内存管理工具。对比glibc中的ptmalloc2，tcmalloc对多线程更加友好。增加了线程局部的分配器，对小内存的分配进行了优化。
 
 
 
@@ -175,11 +175,11 @@ type heapArena struct {
 	// bitmap是一个byte数组，它用于表达在64MB的arena空间中，是否需要被GC扫描。
 	// 其中每2个bit表达arena中的一个PtrSize（64bit）空间。所以bitmap数组长度为2MB。
 	// 2bit的地位表示对应的arena中start+N*PtrSize位置开始的8字节上是否有指针。
-	// 0表示没有，1表示有。而高bit位为【TODO】
+	// 2bit中，高位表示是否需要被GC关心，低位表示当前bitmap表达的bytes是否包含指针。
 	bitmap [heapArenaBitmapBytes]byte
 
 
-	// arena被按照page大小划分，在amd64Go中page为8KB，所以pagesPerArena也是8KB。
+	// arena被按照系统页大小划分，在amd64Go中page为8KB，所以pagesPerArena也是8KB。
 	// 即arena空间被分为0 - (8192-1)个mspan指针。其中被分配的page，对应在spans中
 	// 的mspan	为当前持有该空间的mspan指针。如果一个区域没有被使用，则这个区域的首尾
 	// page在spans中的对象指向该mspan。如果arena中一段page序列从来未分配过，则该
@@ -287,7 +287,7 @@ setSpan和setSpans建立起了heapArena到mspan的映射关系，这为后面实
 
 
 
-#### 如何判定内存是否在堆上
+#### 如何判定指针是否在堆上
 
 go堆中的内存，所有已分配的空间是由称作mspan类型的对象来持有并管理的，在原始虚拟内存中，mallocinit初始化时限定了堆内存的绝对分配范围，mheap通过heapArena对所有的堆内存进行了划分，而heapArena中的spans成员又保存了64MB的空间下每个物理页归属的mspan对象。所以只要是有效的堆内存地址，都可以唯一地映射到一个heapArena对象上。也可以直接映射到一个mspan对象上。
 
@@ -424,8 +424,6 @@ persistentalloc调用了persistentalloc1方法。
 persistentalloc1方法返回的是一个notInHeap指针，表明了该方法申请的内存不是在go划分的原始堆内存以内申请的。实际上由于调用的是sysAlloc方法，所以chunk分配在哪儿、实际内存在什么位置由操作系统决定。
 
 persistentalloc1分配的内存不提供释放方法。这是由于该方法申请的空间在上层大多提供对象池实现，所以总体上来说其已分配的内存是收敛的。
-
-【图：小内存分配的图例】
 
 
 
@@ -654,7 +652,7 @@ type mheap struct {
 
 go runtime中通过以下途径，来解决上述问题
 
-1. 缓存已申请但未分配的内存。
+1. 建立堆缓存减少系统调用。
 2. 将缓存的内存块按照大小分开管理。
 3. 将不需要被GC扫描的内存分开管理。
 4. 将空闲的连续内存块合并。
