@@ -1,38 +1,34 @@
-虚拟内存概念介绍
+# 综述
 
-操作系统的内存管理简介
+## 讨论什么
 
-内存管理面临的问题和挑战
+本文主要讨论go语言的运行时环境，对虚拟内存的管理与优化。go的runtime内存管理，封装了OS层的细节，为GMP运行时环境提供了内存申请的功能。并提供一系列辅助方法协助runtime完成内存的垃圾回收、用量统计等功能。
 
-内存管理的常见方式
+内存管理与垃圾回收密不可分，在本文中讨论的内容虽然主要是内存管理，但也会对GC和gmp的一些内容简要介绍。
+
+这里假设读者已经具有基本的操作系统常识、对虚拟内存的基本认知、系统内存管理api以及一般的内存管理常识等知识。
+
+第一部分讨论了go对系统虚拟内存的封装、对虚拟内存空间的规划等基本方法。
+
+第二部分讨论了go在内存缓存、内存分配、分片、合并、多线程支持等方面的实现原理。
+
+第三部分讨论了内存管理的应用。即runtime提供给go使用者的相关接口和逻辑。
+
+第四部分讨论了go内存的回收。
+
+
+
+## runtime代码范围
+
+本文讨论的代码范围如下：
+
+malloc.go、mheap.go、mmap.go、mcache.go、mcentral.go、sizeclasses.go、mgclarge.go、mfixalloc.go、mbitmap.go
+
+共约4K行代码
 
 
 
 # 预备知识
-
-## 代码范围
-
-本文讨论的代码范围如下：
-
-runtime/malloc.go
-
-runtime/mheap.go
-
-runtime/mmap.go
-
-runtime/mcache.go
-
-runtime/mcentral.go
-
-runtime/sizeclasses.go
-
-runtime/mgclarge.go
-
-runtime/mfixalloc.go
-
-runtime/mbitmap.go
-
-约4K行代码
 
 
 
@@ -324,7 +320,11 @@ func spanOfHeap(p uintptr) *mspan
 
 如果一段arena虚拟内存地址没有在go中被分配过，则其地址对应的heapArena指针为空。
 
+
+
 #### TODO：arenas的应用
+
+
 
 ## 内存分配核心方法
 
