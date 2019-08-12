@@ -891,6 +891,8 @@ func (h *mheap) grow(npage uintptr) bool {
 - allocSpanLocked优先从已分配堆内存中进行分配，如果没有合适的堆内存块（mspan），则触发堆增长，并再次申请。
 - freeSpanLocked将内存块归还到已分配堆内存队列中。一个额外动作是，通过检查当前mspan空间的和其连续空间的前后mspan是否均处于_MSpanFree状态，来决定是否要合并这些mspan。
 
+注意这两个方法的命名。Locked表示对这两个方法的调用需要使用mheap.lock加锁，因为其内部操作了mheap的缓存队列或mTreap。
+
 
 
 ### allocSpanLocked（分配）
@@ -927,8 +929,9 @@ HaveSpan:
 	// ...
 
 	if s.npages > npage {
+		// 从mtreap中获得mspan为最小的满足npage需求的mspan，其实际空间可能大于需求量
 		// 如果实际分配的空间大于需求的空间，则使用多余出来的空间构造出一个新的mspan
-		// 将新的mspan归还给堆
+		// 将新的mspan归还给堆缓存
 		t := (*mspan)(h.spanalloc.alloc())
 		t.init(s.base()+npage<<_PageShift, s.npages-npage)
 		s.npages = npage
@@ -954,6 +957,8 @@ HaveSpan:
 allocSpanLocked仅会返回满足需求页数量的内存空间，如果查找到堆中的mspan拥有的系统页数量超过需求量，多余的系统页将被额外新创建的mspan持有，并写回堆缓存中。
 
 allocSpanLocked主要完成空闲mspan从free、freelarge的脱链，返回的mspan处于_MSpanFree状态。
+
+查找mheap.free时时间复杂度最大为O（N）
 
 
 
@@ -1000,7 +1005,7 @@ func (h *mheap) freeSpanLocked(s *mspan, acctinuse, acctidle bool, unusedsince i
 		} else {
 			h.freeList(after.npages).remove(after)
 		}
-    // 释放before mspan对象，归还到spanalloc固定对象分配器中，固定对象分配器
+    // 释放after mspan对象，归还到spanalloc固定对象分配器中，固定对象分配器
 		// 要求传入的mspan状态必须为_MSpanDead
 		after.state = _MSpanDead
 		h.spanalloc.free(unsafe.Pointer(after))
@@ -1257,6 +1262,48 @@ type mcache struct {
   local_largefree  uintptr                  // bytes freed for large objects (>maxsmallsize)
   local_nlargefree uintptr                  // number of frees for large objects (>maxsmallsize)
   local_nsmallfree [_NumSizeClasses]uintptr // number of frees for small objects (<=maxsmallsize)
+}
+```
+
+
+
+#### mcache分配小对象空间
+
+```go
+func (c *mcache) nextFree(spc spanClass) (v gclinkptr, s *mspan, shouldhelpgc bool) {
+	s = c.alloc[spc]
+	shouldhelpgc = false
+	// 获取mspan中的空闲slot
+	freeIndex := s.nextFreeIndex()
+	if freeIndex == s.nelems {
+		// 当前mspan已经没有可用空间
+		if uintptr(s.allocCount) != s.nelems {
+			println("runtime: s.allocCount=", s.allocCount, "s.nelems=", s.nelems)
+			throw("s.allocCount != s.nelems && freeIndex == s.nelems")
+		}
+		// 调用refill，从mcentral申请新的mspan并填充mcache
+		systemstack(func() {
+			c.refill(spc)
+		})
+    // 借用当前用户goroutine辅助GC
+		shouldhelpgc = true
+		s = c.alloc[spc]
+
+		freeIndex = s.nextFreeIndex()
+	}
+
+	if freeIndex >= s.nelems {
+		throw("freeIndex is not valid")
+	}
+
+	// 增加已申请计数，返回空闲slot起始地址
+	v = gclinkptr(freeIndex*s.elemsize + s.base())
+	s.allocCount++
+	if uintptr(s.allocCount) > s.nelems {
+		println("s.allocCount=", s.allocCount, "s.nelems=", s.nelems)
+		throw("s.allocCount > s.nelems")
+	}
+	return
 }
 ```
 
