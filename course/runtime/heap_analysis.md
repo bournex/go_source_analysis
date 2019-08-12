@@ -1169,9 +1169,9 @@ type mcentral struct {
 	lock      mutex
 	// 当前mcentral对象的spanClass
 	spanclass spanClass
-	// 空闲mspan链表
+	// 依然有剩余slot的mspan链表
 	nonempty  mSpanList
-	// 使用中mspan链表
+	// 已经被mcache缓存或已无空闲空间的mspan链表。
 	empty     mSpanList
 	// 
 	nmalloc uint64
@@ -1233,7 +1233,9 @@ mspan.incache被设置为true。
 
 #### freeSpan
 
-将s移到nonempty链表。如果s中已经没有被分配的对象了（s.allocCount == 0）。则将mspan归还给mheap。
+将s移到nonempty链表。如果s中已经没有被分配的对象了（s.allocCount == 0）。则将mspan归还给mheap。调用时mspan必须没有被mcache缓存持有。
+
+该方法会在mspan的sweep过程中被调用。与uncacheSpan不同，如果sweep清空了该mspan的所有slot，则mspan会从mcentral移动到mheap缓存中。
 
 
 
@@ -1306,6 +1308,10 @@ func (c *mcache) nextFree(spc spanClass) (v gclinkptr, s *mspan, shouldhelpgc bo
 	return
 }
 ```
+
+根据spanClass获得相应的mspan对象，在其中查找空闲slot并分配。如果当前spanClass对应的mspan已经无空闲slot，则通过refill向对应spanClass的mcentral获取新的mspan。
+
+虽然refill覆盖了前一个mspan在mcache中的指针，但是旧的mspan在mcentral.empty中依然存在。这部分mspan将会在GC时被扫描。
 
 
 
