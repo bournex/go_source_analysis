@@ -2,7 +2,7 @@
 
 ## 讨论什么
 
-本文主要讨论go语言的运行时环境，对虚拟内存的管理与优化。go的runtime内存管理，封装了OS层的细节，为GMP运行时环境提供了内存申请的功能。并提供一系列辅助方法协助runtime完成内存的垃圾回收、用量统计等功能。
+本文主要讨论go语言的运行时环境，对虚拟内存的管理与优化。go的runtime内存管理，封装了OS层的细节，为GMP运行时环境提供了内存管理功能。并提供一系列辅助方法协助runtime完成内存的垃圾回收、用量统计等功能。
 
 内存管理与垃圾回收密不可分，在本文中讨论的内容虽然主要是内存管理，但也会对GC和gmp的一些内容简要介绍。
 
@@ -175,12 +175,12 @@ type heapArena struct {
 	bitmap [heapArenaBitmapBytes]byte
 
 
-	// arena被按照系统页大小划分，在amd64Go中page为8KB，所以pagesPerArena也是8KB。
-	// 即arena空间被分为0 - (8192-1)个mspan指针。其中被分配的page，对应在spans中
-	// 的mspan	为当前持有该空间的mspan指针。如果一个区域没有被使用，则这个区域的首尾
-	// page在spans中的对象指向该mspan。如果arena中一段page序列从来未分配过，则该
-	// 区间的page在spans中的mspan指针值为nil。setSpan方法完成了对spans的初始化。
-	// 写需要加锁，读不需要加锁
+	// arena被按照系统页大小划分，在amd64Go中page为8KB，所以pagesPerArena
+	// 也是8KB。即arena空间被分为0 - (8192-1)个mspan指针。其中被分配的page
+	// ，对应在spans中的mspan	为当前持有该空间的mspan指针。如果一个区域没有
+	// 被使用，则这个区域的首尾page在spans中的对象指向该mspan。如果arena中
+	// 一段page序列从来未分配过，则该区间的page在spans中的mspan指针值为nil。
+	// setSpan方法完成了对spans的初始化。写需要加锁，读不需要。
 	spans [pagesPerArena]*mspan
 }
 ```
@@ -1565,26 +1565,9 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 
 # 内存分配流程
 
-## 小对象内存分配
-
-调用链分析
-
-![](https://raw.githubusercontent.com/bournex/go_source_analysis/master/images/goheap-tinysmallalloc.jpg)
-
-1. 将申请的小内存需求大小对齐到最小满足需求的sizeclass，查看当前m对象下的mcache中是否有满足需求的mspan，如果mspan有空闲空间，则直接分配空间。整个过程无需加锁。
-2. 从mcentral获取一个满足需求sizeclass的mspan。
-3. 如果mcentral对应sizeclass的mspan列表为空，则向堆（缓存）以page为单位申请空间，用于构建新的mspan。
-4. 如果堆（缓存）中没有可用的mspan，则向操作系统申请空间，在64位系统上，一次会申请一个Arena，即64MB。
+## 内存分配流程串联
 
 
-
-## 大对象内存分配
-
-![](https://raw.githubusercontent.com/bournex/go_source_analysis/master/images/goheap-largealloc.jpg)
-
-
-
-大对象内存申请绕过了mcache和mcentral，直接向堆（缓存）申请空间。而后同小内存分配的过程4。
 
 # 堆内存的回收
 
@@ -1614,24 +1597,6 @@ func Ctz64(x uint64) int {
 	i := int(deBruijnIdx64[y])   // convert to bit index
 	z := int((x - 1) >> 57 & 64) // adjustment if zero
 	return i + z
-}
-```
-
-## fastrand
-
-```go
-func fastrand() uint32 {
-	mp := getg().m
-	// Implement xorshift64+: 2 32-bit xorshift sequences added together.
-	// Shift triplet [17,7,16] was calculated as indicated in Marsaglia's
-	// Xorshift paper: https://www.jstatsoft.org/article/view/v008i14/xorshift.pdf
-	// This generator passes the SmallCrush suite, part of TestU01 framework:
-	// http://simul.iro.umontreal.ca/testu01/tu01.html
-	s1, s0 := mp.fastrand[0], mp.fastrand[1]
-	s1 ^= s1 << 17
-	s1 = s1 ^ s0 ^ s1>>7 ^ s0>>16
-	mp.fastrand[0], mp.fastrand[1] = s0, s1
-	return s0 + s1
 }
 ```
 
