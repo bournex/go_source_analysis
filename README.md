@@ -1,17 +1,17 @@
 ## overview
 
-go源码阅读笔记，计划对go的runtime、标准库、编译器部分进行阅读分析。阅读为主，记录为辅。
+go源码阅读笔记，涉及runtime核心、标准库部分内容和go编译器代码。
 
 ## catalog
 
 #### runtime
 
 - 内存管理
-- gmp
-- 调度
-- gc
+- gmp [todo]
+- 调度 [todo]
+- gc [todo]
 
-#### library
+#### library [todo]
 
-#### compiler
+#### compiler [todo]
 
