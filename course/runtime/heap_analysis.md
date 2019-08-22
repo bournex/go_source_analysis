@@ -20,7 +20,7 @@
 
 ## runtime代码范围
 
-本文讨论的代码范围如下：
+本文讨论的runtime代码范围如下：
 
 malloc.go、mheap.go、mmap.go、mcache.go、mcentral.go、sizeclasses.go、mgclarge.go、mfixalloc.go、mbitmap.go
 
@@ -82,7 +82,9 @@ const(
 
 ## 设计思想
 
-go的内存管理参考了tcmalloc，tcmalloc是google开源的一款内存管理工具。对比glibc中的ptmalloc2，tcmalloc对多线程更加友好。增加了线程局部的分配器，对小内存的分配进行了优化。
+go的内存管理参考了tcmalloc，tcmalloc是google开源的一款内存管理工具。对比glibc中的ptmalloc2，tcmalloc对多线程更加友好。增加了分配器的跨线程使用，解决了ptmalloc中线程局部分配器不均匀的问题，并对小内存的分配进行了优化。
+
+go中弱化了线程的概念，提出了goroutine的并发模型，runtime中实现了系统线程对goroutine的调度和资源管理，但其goroutine还是依赖线程来实现的并发，所以线程局部分配器，还是在系统线程的层面管理。具体来说，p对象和工作中的m对象都会持有线程局部的分配器。
 
 
 
@@ -159,7 +161,7 @@ arenahint指向最原始的虚拟内存空间，runtime.sysAlloc函数分配空�
 
 arena是tcmalloc中没有的概念，go中基于垃圾回收的考虑，需要对内存进行更加精细化的管理。所以增加了arena的概念。arena中文翻译是竞技场，没什么卵用。
 
-go中将arena定义为一段连续的64MB空间。堆原始内存的分配，提供的接口为系统页数量，实际分配时会对齐到64MB的arena来分配。
+go中将arena定义为一段连续的64MB空间。堆原始内存的分配，提供的接口为系统页数量，实际分配时会对齐到64MB的arena来分配，即所有arena的起始地址，都是从虚拟地址空间0x0开始的64MB整数倍位置。
 
 
 
@@ -760,38 +762,6 @@ type mSpanList struct {
 
 
 
-### mspan空闲块
-
-mspan在mcache或mcentral中被用于小内存分配时，需要将以page为单位从mheap获取的空间按照sizeclass划分。比如包含1个page大小8KB的mspan，当被用作16字节对象分配时，它最多可以分配8192/16=512个对象。mspan的空闲块管理的主要工作就是管理这些对象空间。
-
-
-
-空闲块的管理主要通过mspan中的allocBits、allocCache、freeindex和nelems成员实现。
-
-allocBits的类型为gcBits，实际就是byte指针类型。
-
-在mspan被初始化时，通过指定的sizeclass/spanclass，可以计算出其最多可申请的对象数量，还以上面的例子为例：
-
-将mspan的8KB空间视为512个slot。
-
-freeindex在mspan初始化时被置为0。
-
-allocBits作为mspan空间的位图，使用512个bit位（64bytes）表达512个slot的分配状态。如果slot已被分配，则对应位为1，否则为0。
-
-allocCache作为allocBits的滑动窗口，表示当前窗口下的64个slot，配合freeindex和德布鲁因算法，快速查找当前窗口下的空闲slot。不同于allocBits，在allocCache中bit位为1的表示未分配，0表示已分配。
-
-nelems == 512，表示可分配对象的最大数量。
-
-
-
-### mspan空闲块的查找
-
-#### nextFreeFast
-
-#### nextFree
-
-
-
 ## 堆缓存管理
 
 ```go
@@ -895,7 +865,7 @@ func (h *mheap) grow(npage uintptr) bool {
 
 
 
-### allocSpanLocked（分配）
+### allocSpanLocked
 
 ```go
 func (h *mheap) allocSpanLocked(npage uintptr, stat *uint64) *mspan {
@@ -962,7 +932,7 @@ allocSpanLocked主要完成空闲mspan从free、freelarge的脱链，返回的ms
 
 
 
-### freeSpanLocked（释放）
+### freeSpanLocked
 
 ```go
 func (h *mheap) freeSpanLocked(s *mspan, acctinuse, acctidle bool, unusedsince int64) {
@@ -1096,7 +1066,43 @@ alloc_m调用allocSpanLocked分配了合适的mspan，完成了mspan的初始化
 
 
 
-## 基于缓存的小对象分配器
+## 小对象mspan
+
+
+
+### mspan空闲块
+
+mspan在mcache或mcentral中被用于小内存分配时，需要将以page为单位从mheap获取的空间按照sizeclass划分。比如包含1个page大小8KB的mspan，当被用作16字节对象分配时，它最多可以分配8192/16=512个对象。mspan的空闲块管理的主要工作就是管理这些对象空间。
+
+
+
+空闲块的管理主要通过mspan中的allocBits、allocCache、freeindex和nelems成员实现。
+
+allocBits的类型为gcBits，实际就是byte指针类型。
+
+在mspan被初始化时，通过指定的sizeclass/spanclass，可以计算出其最多可申请的对象数量，还以上面的例子为例：
+
+将mspan的8KB空间视为512个slot。
+
+freeindex在mspan初始化时被置为0。
+
+allocBits作为mspan空间的位图，使用512个bit位（64bytes）表达512个slot的分配状态。如果slot已被分配，则对应位为1，否则为0。
+
+allocCache作为allocBits的滑动窗口，表示当前窗口下的64个slot，配合freeindex和德布鲁因算法，快速查找当前窗口下的空闲slot。不同于allocBits，在allocCache中bit位为1的表示未分配，0表示已分配。
+
+nelems == 512，表示可分配对象的最大数量。
+
+
+
+### mspan空闲块的查找
+
+#### nextFreeFast
+
+#### nextFree
+
+
+
+## 小对象内存划分
 
 在内存管理中，大块内存比较容易管理，小块内存则是产生内存碎片的祸根。如果任由小块内存在系统中随机分配，最终可能会出现无法申请连续大块内存的情况。
 
@@ -1142,6 +1148,8 @@ spanClass是sizeClass的一种特殊表达，它将sizeClass的索引（即0-66�
 go在编译期间，通过对代码的静态分析可以得出内存分配的类型，以及类型中是否包含指针类型。这是对象是否需要被GC扫描的重要依据。当runtime进行内存分配时，可以通过将需要扫描的和不需要扫描的对象分开管理申请和释放。提升无指针类型申请和释放的效率。
 
 
+
+## 小对象内存分配器
 
 ### mcentral
 
@@ -1576,6 +1584,8 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 ## scavengelist
 
 ## scavengetreap
+
+## Finalizer&SetFinalizer
 
 ## 回收时机
 
