@@ -1179,7 +1179,7 @@ type mheap struct {
 	central [numSpanClasses]struct {
 		// mcentral对象
 		mcentral mcentral
-		// 用于对齐的padding块
+		// 用于对齐的padding块，关键词false sharing
 		pad      [sys.CacheLineSize - unsafe.Sizeof(mcentral{})%sys.CacheLineSize]byte
 	}
 }
