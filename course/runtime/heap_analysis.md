@@ -22,7 +22,23 @@
 
 本文讨论的runtime代码范围如下：
 
-malloc.go、mheap.go、mmap.go、mcache.go、mcentral.go、sizeclasses.go、mgclarge.go、mfixalloc.go、mbitmap.go
+mmap.go - 系统api封装，操作系统相关
+
+malloc.go - 系统内存管理封装，new关键字主要逻辑实现
+
+mheap.go - 堆内存管理
+
+mcentral.go - 小内存中央分配器
+
+mcache.go - 小内存线程局部分配器
+
+sizeclasses.go - size类定义
+
+mgclarge.go - 树堆数据结构实现及大内存回收
+
+mfixalloc.go - 定长非堆通用分配器
+
+mbitmap.go - mspan对象位图操作
 
 共约4K行代码
 
@@ -250,8 +266,8 @@ amd在设计64位系统的虚拟内存空间时，对地址定义做了如下限
 
 根据这一规则，go中将index的计算进行了特殊处理，即向地址追加一个0x8000 0000 0000的arena基址再计算index，这会产生如下效果：
 
-- 对于小于等于0x7FFF FFFF FFFF的地址，追加arena基址后，获得的arenaIndex位于arenas二维数组的后半部分。
-- 对于大于0x7FFF FFFF FFFF的地址，追加arena基址后，触发了地址值的溢出，因此获得的arenaIndex位于arenas二位数组的前半部分。
+- 对于0x0000 0000 0000 - 0x7FFF FFFF FFFF的地址，追加arena基址后，获得的arenaIndex位于arenas二维数组的后半部分。
+- 对于0x8000 0000 0000 - 0xFFFF FFFF FFFF的地址，追加arena基址后，触发了地址值的溢出，由于这部分地址的高位为0xFFFF，因此计算后获得的arenaIndex位于arenas二位数组的前半部分。
 
 
 
@@ -324,10 +340,6 @@ func spanOfHeap(p uintptr) *mspan
 
 
 
-#### TODO：arenas的应用
-
-
-
 ## 内存分配核心方法
 
 malloc.go中提供了几个主要的内存分配方法。这些方法实现了对操作系统虚拟内存空间的分配。通常来说这些方法不提供内存的释放。因为在malloc.go基础上，runtime实现了大部分内存的复用。
@@ -343,7 +355,7 @@ func sysMap(v unsafe.Pointer, n uintptr, sysStat *uint64)
 func sysReserve(v unsafe.Pointer, n uintptr) unsafe.Pointer
 // 释放从v开始的长度为n的内存，底层依赖munmap
 func sysFree(v unsafe.Pointer, n uintptr, sysStat *uint64)
-// 申请长度为n的内存，返回系统指定的虚拟内存空间起始地址
+// 申请长度为n的内存，返回系统指定的虚拟内存空间起始地址，底层依赖mmap
 func sysAlloc(n uintptr, sysStat *uint64) unsafe.Pointer
 // 向系统归还从v开始的指定长度n的内存，底层依赖madvise
 func sysUnused(v unsafe.Pointer, n uintptr)
@@ -1147,13 +1159,19 @@ spanClass是sizeClass的一种特殊表达，它将sizeClass的索引（即0-66�
 
 go在编译期间，通过对代码的静态分析可以得出内存分配的类型，以及类型中是否包含指针类型。这是对象是否需要被GC扫描的重要依据。当runtime进行内存分配时，可以通过将需要扫描的和不需要扫描的对象分开管理申请和释放。提升无指针类型申请和释放的效率。
 
+全局常量numSpanClasses表示了有多少个spanclass。
+
+
+
+最大32KB的小内存分配器覆盖了大多数的应用场景，而这部分内存的分配，都会优先通过线程局部的分配器无锁分配，这极大加速了内存分配的性能。下面我们来看看go是如何处理小内存需求的分配的。
+
 
 
 ## 小对象内存分配器
 
 ### mcentral
 
-堆中的mcentral数组维护了所有67<<1个spanClass对应的中央分配器对象，每个mcentral对象只负责一个spanClass的内存分配。
+堆中的mcentral数组维护了所有67<<1= 134个spanClass对应的中央分配器对象，每个mcentral对象只负责一个spanClass的内存分配。
 
 ```go
 type mheap struct {
@@ -1408,6 +1426,20 @@ func (h *mheap) freeManual(s *mspan, stat *uint64) {
 ## mspan的状态变迁
 
 ![](https://raw.githubusercontent.com/bournex/go_source_analysis/master/images/goheap-spanstatus.jpg)
+
+
+
+## summary
+
+在堆内存管理部分，我们首先介绍了span的概念，它是持有堆内存的最小单元。其所持有的空间大小一定是系统页的整数倍。
+
+mheap结构是堆最重要的数据结构，首先我们介绍了堆缓存，以32KB划分的大小内存使用不同的数据结构维护。数据结构中的元素就是mspan对象。
+
+在mheap.go中，定义了一个全局唯一的mheap对象，所以对于堆的缓存读写需要加锁。allocSpanLocked和freeSpanLocked实现了对堆缓存的申请和归还，但是其本身并没有对mheap加锁，其函数签名也表明了，对这两个方法的调用需要加锁。
+
+alloc/alloc_m在对堆加锁的基础上，增加了对返回mspan的一些初始化和清零工作。
+
+通过这部分学习可以得知，mspan在mheap缓存中，按照页大小管理。为了满足小内存的分配需求，这里引入了sizeclass和spanclass的概念，并在此基础上，介绍了小内存的分配方式。
 
 
 
