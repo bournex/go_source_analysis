@@ -629,7 +629,7 @@ type mheap struct {
 	// treapNode树堆节点对象分配器
 	treapalloc            fixalloc
 	// TODO
-	specialfinalizeralloc fixalloc
+	  fixalloc
 	// TODO
 	specialprofilealloc   fixalloc
 	// arenaHint对象分配器
@@ -794,7 +794,7 @@ type mheap struct {
 
 mheap中使用4个数据结构表达了当前已经缓存的原始堆内存。
 
-用于分配tiny和small对象空间的mspan，通过free、busy链表数组来记录
+// 用于分配tiny和small对象空间的mspan，通过free、busy链表数组来记录
 
 用于分配large对象空间的mspan，通过freelarge树堆、busylarge链表来记录
 
@@ -1425,6 +1425,29 @@ func (h *mheap) freeManual(s *mspan, stat *uint64) {
 
 ## mspan的状态变迁
 
+前面多处涉及到了mspan的创建、归还到缓存的过程，在过程中mspan的状态一直发生着变化。go中的mspan.state字段记录了当前mspan的状态值。这里共有四种状态：
+
+```go
+const (
+	// 当mspan被创建和初始化时，状态为dead
+	_MSpanDead   mSpanState = iota
+	// 无论是在mcentral、mcache中缓存的mspan，还是通过largeAlloc分配的大
+	// 内存mspan，只要是存在于mheap的busy列表中的mspan，都会被置为inuse状态
+	_MSpanInUse
+	// Manual申请的内存，会被标记为Manual，这部分内存不会通过GC来归还，需要
+	// 使用者显式调用freeManual归还到堆缓存
+	// 此外allocSpanLocked中堆返回内存量大于请求量时，归还部分内存会暂时把
+	// 两个连续mspan的状态置为Manual，避免free合并刚申请的空间。
+	_MSpanManual
+	// 处于堆缓存free列表和mtreap的mspan会被置为free状态。
+	_MSpanFree
+)
+```
+
+
+
+
+
 ![](https://raw.githubusercontent.com/bournex/go_source_analysis/master/images/goheap-spanstatus.jpg)
 
 
@@ -1440,6 +1463,10 @@ mheap结构是堆最重要的数据结构，首先我们介绍了堆缓存，以
 alloc/alloc_m在对堆加锁的基础上，增加了对返回mspan的一些初始化和清零工作。
 
 通过这部分学习可以得知，mspan在mheap缓存中，按照页大小管理。为了满足小内存的分配需求，这里引入了sizeclass和spanclass的概念，并在此基础上，介绍了小内存的分配方式。
+
+为了加速小内存的分配，在堆提供的以page为单位的分配器之上，又提供了基于sizeclass划分mspan的mcentral全局小内存分配器和线程局部的分配器mcache。
+
+对于大对象的分配，则直接从树堆中分配。
 
 
 
@@ -1476,6 +1503,8 @@ func newarray(typ *_type, n int) unsafe.Pointer {
 ```
 
 如果new创建的是一个数组类型，则编译器会将其替换为newarray方法调用。同样，newarray也指向了mallocgc。
+
+由于go中的数组长度也是类型的一部分，所以实际在通过new创建数组对象时，并没有调用newarray，malloc.go中的newarray仅在
 
 
 
