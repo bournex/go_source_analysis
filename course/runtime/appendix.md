@@ -111,7 +111,7 @@ type m struct {
 	mallocing     int32
 	throwing      int32
 	preemptoff    string // if != "", keep curg running on this m
-	locks         int32
+	locks         int32	// m对象当前被持有计数
 	dying         int32
 	profilehz     int32
 	helpgc        int32
@@ -257,7 +257,7 @@ type p struct {
 ```go
 type schedt struct {
 	// accessed atomically. keep at top to ensure alignment on 32-bit systems.
-  // goroutine ID生成器，从0开始递增，p对象每次从这里获取16个id。
+  // goroutine ID生成器，从0开始递增，p对象每次从这里批量获取16个id。
 	goidgen  uint64
 	lastpoll uint64
 
